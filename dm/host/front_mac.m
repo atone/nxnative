@@ -5,10 +5,12 @@
 // (macOS names a Switch Pro Controller's buttons by their printed letters: buttonA is the right one), by position (right A, bottom B, top X, left Y, as in DmGamepad.m) when it reports none.
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
+#include <IOKit/hid/IOHIDManager.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #include "dm.h"
 #include "dm_input.h"
+#include "dm_padmap.h"
 #include "dm_uiscreen.h"
 void mtl_set_ui_rect_fn(void (*fn)(double *y, double *h));
 static void ui_rect_frac(double *fy, double *fh) { int x, y, w, h, rw = 0, rh = 0; dm_ui_rect(&x, &y, &w, &h); if (dm_screen_real(&rw, &rh) && rh > 0) { *fy = (double)y / rh; *fh = (double)h / rh; } }   // Same as front_ios.m: vertical position and height of the UI rectangle (as fractions of the frame height)
@@ -60,10 +62,35 @@ static void read_pad(GCExtendedGamepad *g) {
     #undef K
     dm_pad_set(m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
+// Switch Pro Controller: macOS lights the ring around its HOME button for as long as it is connected (on the Switch it stays dark except for notifications). GameController has no control for it,
+// so the controller's own "set HOME light" subcommand (0x38, all-zero arguments = off) goes to it as HID output report 0x01 (packet counter, neutral rumble, subcommand). Only the LED changes; reconnecting restores
+// macOS's behaviour. Sent a second after each connect so it lands after the system driver's own setup. DM_PAD_HOME_LED=1 leaves the light alone
+static void pro_home_led_off(void) {
+    if (getenv("DM_PAD_HOME_LED")) return;
+    IOHIDManagerRef m = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    int vid = 0x057E, pid = 0x2009;
+    CFNumberRef v = CFNumberCreate(NULL, kCFNumberIntType, &vid), p = CFNumberCreate(NULL, kCFNumberIntType, &pid);
+    const void *k[] = {CFSTR(kIOHIDVendorIDKey), CFSTR(kIOHIDProductIDKey)}, *val[] = {v, p};
+    CFDictionaryRef match = CFDictionaryCreate(NULL, k, val, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    IOHIDManagerSetDeviceMatching(m, match); IOHIDManagerOpen(m, kIOHIDOptionsTypeNone);
+    CFSetRef set = IOHIDManagerCopyDevices(m); int sent = 0;
+    if (set) {
+        CFIndex n = CFSetGetCount(set); const void **devs = calloc((size_t)n, sizeof *devs); CFSetGetValues(set, devs);
+        for (CFIndex i = 0; i < n; i++) {
+            IOHIDDeviceRef d = (IOHIDDeviceRef)devs[i];
+            uint8_t r[49] = {0x01, 0x00, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x38};
+            if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) == kIOReturnSuccess) { if (IOHIDDeviceSetReport(d, kIOHIDReportTypeOutput, 0x01, r, sizeof r) == kIOReturnSuccess) sent++; IOHIDDeviceClose(d, kIOHIDOptionsTypeNone); }
+        }
+        free(devs); CFRelease(set);
+    }
+    LOG("Pro 手柄 HOME 键灯：关（%d 个）", sent);
+    IOHIDManagerClose(m, kIOHIDOptionsTypeNone); CFRelease(m); CFRelease(match); CFRelease(v); CFRelease(p);
+}
 static void pads_changed(void) {
     int any = 0;
     for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
         GCExtendedGamepad *e = c.extendedGamepad;
+        if (!e.valueChangedHandler && dm_padmap_has(c.productCategory.UTF8String, "pro controller")) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ pro_home_led_off(); });
         if (!e.valueChangedHandler) LOG("手柄已连接：%s（%s），面键符号 buttonA=%s buttonB=%s buttonX=%s buttonY=%s", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?",
                                         e.buttonA.sfSymbolsName.UTF8String ?: "-", e.buttonB.sfSymbolsName.UTF8String ?: "-", e.buttonX.sfSymbolsName.UTF8String ?: "-", e.buttonY.sfSymbolsName.UTF8String ?: "-");
         any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
