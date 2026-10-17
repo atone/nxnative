@@ -135,6 +135,7 @@ Record on the game version you ship. At launch the log names each list it read a
 **The Legend of Zelda: Link's Awakening (`01006BB00C6F0000`)**
 - **Engine:** Grezzo's engine on NintendoWare, SDK 8.2.0 (the oldest so far), NVN 53. Modules main + subsdk0 (GLSLC, NVN's runtime shader compiler) + subsdk1 (movie) + sdk; 9,698 shaders from the bfsha archives, effects and layouts.
 - **Window origin:** the only game so far that keeps NVN's default lower-left (OpenGL) window origin; the host flips its viewports and winding and the window image at present ([04](agents/04-graphics.md)). Before that, text the game renders into textures came out upside down.
+- **Depth mode:** the only game so far in NVN's near = 0 depth mode; the host maps the translator's GL-style depth back with the viewport depth range ([04](agents/04-graphics.md)). Before that, the tilt-shift depth of field blurred the whole picture outdoors.
 - **Movies:** VP9 with a 5.1 Vorbis sound track; the host decodes the sound with stb_vorbis.
 - **Mac input:** the title wants L+R: `DM_KEYS="f6000:L+R~0.4,f6300:A,f6500:A,f6700:Down,f6800:A"` reaches a new file's name entry (a fresh save directory via `SV=`).
 - **Frame rate:** gameplay runs at 60 like on the Switch; the game itself drops to 30 (present interval 2) for event cutscenes.

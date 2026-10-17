@@ -7,6 +7,7 @@
 
 void mtl_init(void);
 void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (GL, NVN's default), 0 = upper left (D3D / Metal); see nvn_mtl.m
+void mtl_set_depth_near_zero(int on);     // NVN depth mode: 1 = near = 0 (D3D / Metal), 0 = near = -w (GL, NVN's default); see nvn_mtl.m
 void bf_want_note(const char *key);
 
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
