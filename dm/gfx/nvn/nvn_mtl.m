@@ -804,7 +804,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[84];
+static int g_red_once[96];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("【红】" __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -1339,6 +1339,17 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "贴图对象已失效（magic %#x，首例 ser=%llu）：不建 MTLTexture", t->magic, (unsigned long long)t->serial); return nil; }
+    // Content already in guest memory when a plain texture is first used: on the Switch a texture is its memory, so whatever the CPU put there is what the GPU samples. Breath of the Wild writes its
+    // 256x32x16 RGBA16F atmospheric scattering table straight into the pool (no packaged layout, no WriteTexels); left GPU-only it stayed 0, the sky came out black under the clouds and the
+    // environment probes dark grey. Such a texture (not linear, no flag that lets the GPU write it, CPU-accessible pool, a non-zero word in its storage) is handled as CPU-written from then on
+    // (upload, and re-upload when its pages change). Surveyed at first use: in Breath of the Wild's village route and Link's Awakening's village this is the only texture that qualifies
+    if (!t->has_layout && t->mem && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)
+        && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))
+        && t->L.size && !tex_cpu_written(t->serial) && !serial_get(t->serial)) {
+        const uint64_t *w = (const uint64_t *)t->mem; uint64_t n = t->L.size / 8, i = 0;
+        while (i < n && !w[i]) i++;
+        if (i < n) mtl_tex_cpu_written(t);
+    }
     int packaged = (t->has_layout || tex_cpu_written(t->serial)) && t->mem;
     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged)
         static int ti = -1; static uint32_t tw, th; static uint64_t last[64]; static int nl;
@@ -2097,7 +2108,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, a1; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
@@ -2346,7 +2357,7 @@ void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 // At registration the whole texture object is snapshotted (NVN semantics: the descriptor has been written into the pool); view: the MTLTexture for that ID (a view or the base texture, held via CFBridgingRetain) and the serial-table / guest-write generations at the time it was obtained
 typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view_id, view_rid, view_ser, view_dirty;
                  void *alt, *alt_of; uint64_t alt_rid; uint8_t alt_type;   // alt: compatible view used when the shader's declared type differs from view (tex_fit), alt_of = the view it was built from
-                 void *ar, *ar_of; uint64_t ar_rid; } treg_t;              // ar: the alpha-from-red view for the profile's alpha_from_red shaders (tex_alpha_red), ar_of = the view it was built from
+                 void *ar, *ar_of; uint64_t ar_rid; } treg_t;              // ar: the alpha-from-red / alpha-one view for the profile's alpha_from_red / alpha_one shaders (tex_alpha_red, tex_alpha_one; their formats never overlap), ar_of = the view it was built from
 static treg_t *g_treg; static int g_ntreg;
 // Lock-free copy of texture ID → serial (the replay hot path only needs the serial: store lookahead index, binding set of the clear-only hoist): texture IDs are 20 bits, fixed 1M entries (BSS, only touched pages are used),
 // release write at registration, relaxed atomic read on the reader side, without entering g_rmu (the former h_ser locked and unlocked on every lookup, thousands of times per frame in the camp)
@@ -2517,6 +2528,39 @@ static id<MTLTexture> tex_alpha_red(int tid, id<MTLTexture> t, uint64_t *rid) {
                                                    swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleZero, MTLTextureSwizzleZero, MTLTextureSwizzleRed)];
     if (!v) { RED_ONCE(82, "alpha 取红的视图建不出（贴图号 %d 格式 %lu）", tid, (unsigned long)pf); return nil; }
     { static int once; if (!once++) MLOG("单通道贴图 alpha 取红：首例 贴图号 %d %lux%lu", tid, (unsigned long)t.width, (unsigned long)t.height); }
+    r->ar = (void *)CFBridgingRetain(v); r->ar_of = (__bridge void *)t; r->ar_rid = v.gpuResourceID._impl;
+    *rid = r->ar_rid; return v;
+}
+// Alpha one: the fragment shaders the game profile's alpha_one lists read a four-channel render target whose channel mapping is exactly (R, G, B, 0) as (R, G, B, 1).
+// Breath of the Wild's menu background: when the inventory or the system menu opens, ecb4242efaf4042b copies the final 1920x1080 RGB10A2 image through a view the game registers with
+// mapping (R, G, B, 0) (nvnTextureViewSetSwizzle; the real driver's TIC builder encodes the 0 as constant zero); further passes shrink, blur and colour-grade it into a 320x180 RGB10A2
+// target, carrying that alpha along, and the layout shader 87d900168952ea49 draws the result full screen blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA. Read literally the alpha is 0,
+// the background is invisible and the menu sits on black; on the Switch the blurred scene shows. How the hardware gets alpha 1 is not understood. In BotW only that copy samples
+// such a view. Only render targets qualify. DM_NVN_ALPHA_ONE=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
+static char g_a1_keys[48][20]; static int g_a1_nk = -1;
+static int a1_want(NvShader *sh) {
+    if (!sh->a1) {
+        if (g_a1_nk < 0) { g_a1_nk = 0; const char *e = getenv("DM_NVN_ALPHA_ONE"), *src = e && *e ? e : DM_GAME_ALPHA_ONE;
+            if (strcmp(src, "0")) for (const char *q = src; *q && g_a1_nk < 48;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_a1_keys[g_a1_nk], q, n); g_a1_keys[g_a1_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
+            if (g_a1_nk) MLOG("四通道贴图 alpha 取 1：%s%s", src, e && *e ? "（DM_NVN_ALPHA_ONE）" : "（游戏档案 alpha_one）"); }
+        sh->a1 = 1; for (int i = 0; i < g_a1_nk; i++) if (!strncmp(sh->key, g_a1_keys[i], strlen(g_a1_keys[i]))) sh->a1 = 2;
+    }
+    return sh->a1 == 2;
+}
+static id<MTLTexture> tex_alpha_one(int tid, id<MTLTexture> t, uint64_t *rid) {
+    MTLTextureSwizzleChannels sw = t.swizzle;
+    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleZero || tid <= 0 || tid >= g_ntreg) return nil;
+    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
+    if (!(base.usage & MTLTextureUsageRenderTarget)) return nil;
+    treg_t *r = &g_treg[tid];
+    if (r->ar && r->ar_of == (__bridge void *)t) { *rid = r->ar_rid; return (__bridge id<MTLTexture>)r->ar; }
+    treg_drop_ar(r);
+    NSUInteger l0 = t.parentTexture ? t.parentRelativeLevel : 0, s0 = t.parentTexture ? t.parentRelativeSlice : 0;
+    NSUInteger ns = t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+    id<MTLTexture> v = [base newTextureViewWithPixelFormat:t.pixelFormat textureType:t.textureType levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns)
+                                                   swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleOne)];
+    if (!v) { RED_ONCE(85, "alpha 取 1 的视图建不出（贴图号 %d 格式 %lu）", tid, (unsigned long)t.pixelFormat); return nil; }
+    { static int nlog; if (nlog++ < 4) MLOG("四通道贴图 alpha 取 1：贴图号 %d %lux%lu 格式 %lu", tid, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat); }
     r->ar = (void *)CFBridgingRetain(v); r->ar_of = (__bridge void *)t; r->ar_rid = v.gpuResourceID._impl;
     *rid = r->ar_rid; return v;
 }
@@ -3169,6 +3213,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType, t ? (int)t.swizzle.red : 0, t ? (int)t.swizzle.green : 0, t ? (int)t.swizzle.blue : 0, t ? (int)t.swizzle.alpha : 0, (__bridge void *)(t.parentTexture ? t.parentTexture : t));
             if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit(tid, t, (MTLTextureType)b->dtt, &r2); if (v) { t = v; trid = r2; } }
             if (t && nvn_stage == 1 && afr_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_red(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_red
+            if (t && nvn_stage == 1 && a1_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_one(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_one
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
