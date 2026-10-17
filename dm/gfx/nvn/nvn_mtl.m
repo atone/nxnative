@@ -2496,7 +2496,9 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
     r->alt = (void *)CFBridgingRetain(v); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)want; r->alt_rid = v.gpuResourceID._impl;
     *rid = r->alt_rid; return v;
 }
-// Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel render target whose channel mapping is exactly (R, 0, 0, 1) as (R, 0, 0, R).
+// Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel render target whose channel mapping is exactly (R, 0, 0, 1) as (1, 1, 1, R),
+// the mapping the layout library's packaged one-channel (A8) textures carry. Read as (R, 0, 0, R) the colour of panes that tint the capture came out red or black: the stamina wheel
+// (87d900168952ea49, c0 = (0, 0.89, 0.1)) was a black ring with a red sliver, text glows and the noise meter's waveform were red.
 // Breath of the Wild's layout captures: a layout pane marked CaptureOn (user data "A8", "CaptureScale" 0.5, "MultiFilter"; about 140 layouts) is drawn into an RGBA8 target, blurred at half size,
 // and its alpha copied into the red channel of an R8 texture the game builds with mapping (R, 0, 0, 1); the layout's panes then sample it in place of the FBLayout_00 placeholder.
 // Each HUD prompt bar (PaGuideKey*) draws, per key, a cream glow P_Glow_00 (aa209f57b133e862: colour from the Kumo64 cloud texture, alpha = min(cloud alpha, capture alpha), animated in
@@ -2525,18 +2527,20 @@ static id<MTLTexture> tex_alpha_red(int tid, id<MTLTexture> t, uint64_t *rid) {
     NSUInteger l0 = t.parentTexture ? t.parentRelativeLevel : 0, s0 = t.parentTexture ? t.parentRelativeSlice : 0;
     NSUInteger ns = t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
     id<MTLTexture> v = [base newTextureViewWithPixelFormat:pf textureType:t.textureType levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns)
-                                                   swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleZero, MTLTextureSwizzleZero, MTLTextureSwizzleRed)];
+                                                   swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleRed)];
     if (!v) { RED_ONCE(82, "alpha 取红的视图建不出（贴图号 %d 格式 %lu）", tid, (unsigned long)pf); return nil; }
     { static int once; if (!once++) MLOG("单通道贴图 alpha 取红：首例 贴图号 %d %lux%lu", tid, (unsigned long)t.width, (unsigned long)t.height); }
     r->ar = (void *)CFBridgingRetain(v); r->ar_of = (__bridge void *)t; r->ar_rid = v.gpuResourceID._impl;
     *rid = r->ar_rid; return v;
 }
-// Alpha one: the fragment shaders the game profile's alpha_one lists read a four-channel render target whose channel mapping is exactly (R, G, B, 0) as (R, G, B, 1).
+// Alpha one: the fragment shaders the game profile's alpha_one lists read an RGB10A2 render target as (R, G, B, 1).
 // Breath of the Wild's menu background: when the inventory or the system menu opens, ecb4242efaf4042b copies the final 1920x1080 RGB10A2 image through a view the game registers with
-// mapping (R, G, B, 0) (nvnTextureViewSetSwizzle; the real driver's TIC builder encodes the 0 as constant zero); further passes shrink, blur and colour-grade it into a 320x180 RGB10A2
-// target, carrying that alpha along, and the layout shader 87d900168952ea49 draws the result full screen blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA. Read literally the alpha is 0,
-// the background is invisible and the menu sits on black; on the Switch the blurred scene shows. How the hardware gets alpha 1 is not understood. In BotW only that copy samples
-// such a view. Only render targets qualify. DM_NVN_ALPHA_ONE=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
+// mapping (R, G, B, 0) (nvnTextureViewSetSwizzle; the real driver's TIC builder encodes the 0 as constant zero), further passes shrink, blur and colour-grade it into a 320x180 RGB10A2
+// target, carrying the alpha of 0 along, and the layout shader 87d900168952ea49 draws the result full screen blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA: read literally the menu sits on black,
+// on the Switch the blurred scene shows. The alpha of 0 is right elsewhere: the HUD captures (text glows and shadows, the noise meter) start from the same copy and draw their text or
+// waveform over it, so its alpha is the mask; forcing the copy to 1 turns those into solid boxes. So the rule sits on the shader that draws the captured scene as a picture. RGB10A2 keeps
+// 2 bits of alpha, never a soft mask, and the layout's RGB10A2 render targets are these scene captures. How the hardware shows them is not understood.
+// DM_NVN_ALPHA_ONE=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
 static char g_a1_keys[48][20]; static int g_a1_nk = -1;
 static int a1_want(NvShader *sh) {
     if (!sh->a1) {
@@ -2549,7 +2553,8 @@ static int a1_want(NvShader *sh) {
 }
 static id<MTLTexture> tex_alpha_one(int tid, id<MTLTexture> t, uint64_t *rid) {
     MTLTextureSwizzleChannels sw = t.swizzle;
-    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleZero || tid <= 0 || tid >= g_ntreg) return nil;
+    if (t.pixelFormat != MTLPixelFormatRGB10A2Unorm || tid <= 0 || tid >= g_ntreg) return nil;
+    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) return nil;
     id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
     if (!(base.usage & MTLTextureUsageRenderTarget)) return nil;
     treg_t *r = &g_treg[tid];

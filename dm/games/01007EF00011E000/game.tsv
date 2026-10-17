@@ -23,9 +23,9 @@ pad_layout	full
 # Layout captures (CaptureOn panes, about 140 layouts) keep their blurred alpha in the red channel of an R8 render target mapped R 0 0 1; every pixel-shader variant of the layout library
 # (main's BNSH at 0x1d83000) reads such textures with alpha = red: soft prompt shadows and glows instead of hard-edged boxes and cloud-filled rectangles
 alpha_from_red	d898eb245efdd495 e6a88e12dbae9743 be1d4af059205375 3a0122d004ea74ca 57984f1f48115868 f29dde3d00fb2972 cc37329bf8b7d773 87d900168952ea49 aa209f57b133e862 af07227eeb90304b adcbe3846d1d1ed7 43593beb906b7c6f 11bb9006c60d49d6 e7004fcb0aa6ce8c 896bfbc0413048c9 e1d0faffe4d027a2 8064cd6f18b1b5ed 71c2b3751a9e65f7 3dfe1aa3d996e91e e8ec1269c0f3f2db 302afdb62561cc5c 31e27998ede8f19f 0d532fb24cf738e5 6599d9842b242912 9a09e7e1e7c4cf84 5c490d6406951546
-# The inventory / system menu background: the game copies the scene through a view mapped R G B 0, blurs it into a 320x180 target and blends that by its alpha;
-# with the copy reading alpha = 1 the menu shows the blurred scene as on the Switch instead of black
-alpha_one	ecb4242efaf4042b
+# The inventory / system menu background: a blurred copy of the scene in an RGB10A2 render target whose alpha the copy leaves at 0, drawn by the layout shader 87d90016 blended by
+# that alpha; read with alpha = 1 it shows the blurred scene as on the Switch instead of black (the copy itself stays at 0: the HUD captures use that alpha as their mask)
+alpha_one	87d900168952ea49
 
 # ---- 版本 | Versions ----
 # 只解了合并 1.9.0 的那份；基础版单独的构建号用到时再补 | only the merged 1.9.0 copy is extracted; the base game's own build IDs are added when needed
