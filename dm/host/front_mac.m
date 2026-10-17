@@ -94,16 +94,33 @@ void front_run(void (*guest)(void)) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
-                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        win.contentAspectRatio = NSMakeSize(16, 9); win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+        // Menu bar: Quit (Cmd+Q) and the window commands. Without a main menu Cmd+Q did nothing
+        { NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
+          NSMenuItem *ai = [NSMenuItem new], *wi = [NSMenuItem new]; ai.submenu = app; wi.submenu = wm; [bar addItem:ai]; [bar addItem:wi];
+          [app addItemWithTitle:[@"Quit " stringByAppendingString:@DM_GAME_NAME] action:@selector(terminate:) keyEquivalent:@"q"];
+          [wm addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+          [wm addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+          NSMenuItem *fs = [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"]; fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+          NSApp.mainMenu = bar; NSApp.windowsMenu = wm; }
         NSView *v = win.contentView;
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         g_layer.contentsScale = win.backingScaleFactor;
+        g_layer.contentsGravity = kCAGravityResizeAspect; g_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);   // full screen on a non-16:9 display: letterboxed
         v.layer = g_layer;
+        // The drawable follows the window (it stayed at the first size and was stretched when the window grew): the largest 16:9 size in pixels
+        void (^fit)(void) = ^{ NSSize b = v.bounds.size; CGFloat sc = win.backingScaleFactor, w = b.width * sc, h = b.height * sc;
+            if (w <= 0 || h <= 0) return; if (w * 9 > h * 16) w = h * 16 / 9; else h = w * 9 / 16;
+            g_layer.contentsScale = sc; g_layer.drawableSize = CGSizeMake(floor(w), floor(h)); };
+        fit();
+        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidResizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit(); }];
+        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeBackingPropertiesNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit(); }];
         [win center];
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
@@ -113,23 +130,26 @@ void front_run(void (*guest)(void)) {
         pads_changed();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            if (e.modifierFlags & NSEventModifierFlagCommand) return e;   // Cmd shortcuts go to the menu (Quit, Minimize, Full Screen)
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
-        // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted
+        // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted.
+        // Only clicks on the picture count, and every event still goes on to AppKit: swallowing them (as before) also took the title bar buttons and the click that makes the window active again,
+        // so the window stayed inactive (the game "in the background") and could not be zoomed
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;
-            if (e.type == NSEventTypeLeftMouseUp) { dm_touch_set(NULL, 0); return nil; }
+            if (e.type == NSEventTypeLeftMouseUp) { dm_touch_set(NULL, 0); return e; }
             NSPoint p = [v convertPoint:e.locationInWindow fromView:nil]; NSSize sz = v.bounds.size;
-            if (sz.width <= 0 || sz.height <= 0) return e;
+            if (sz.width <= 0 || sz.height <= 0 || !NSPointInRect(p, v.bounds)) return e;
             dm_touch t = {0, (float)(p.x / sz.width), (float)(1.0 - p.y / sz.height)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
-            dm_touch_set(&t, 1); return nil;
+            dm_touch_set(&t, 1); return e;
         }];
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); if (!win.miniaturized) dm_focus_set(2); }];   // keys held while switching away get no key-up here
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
