@@ -3,6 +3,10 @@
 // --manifest: the RomFS is not written, only a list <output dir>/romfs_manifest.tsv (path, size, first 32 bytes), for surveying a new game (a large game's RomFS is well over 10 GB).
 // Add-on content: nx_extract <prod.keys> --aoc <DLC NSP> <output dir> writes the RomFS of the DLC's data NCA to <output dir> (the packing script puts it at aoc/<index>/, the host mounts it through DM_AOC_DIR).
 // Title keys come from the common tickets (.tik) inside the NSPs, so only prod.keys is needed; key values are never printed.
+// XCI (cartridge dumps) are accepted wherever an NSP is: the NCAs come from the secure partition. One XCI can hold the base game, an update and DLC together, and an update's NCAs carry the
+// base game's title ID in their headers, so contents are told apart by the content meta (CNMT) records: base = Application, update = Patch (the highest version), DLC = AddOnContent.
+// The same XCI may be given as base and update; --aoc takes an optional DLC title ID.
+// nx_extract <prod.keys> --list <NSP or XCI> lists the content meta records: type, title ID, version (for the packing script and for checking a dump).
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -17,6 +21,9 @@ using LibHac.Tools.Fs;
 using LibHac.Tools.FsSystem;
 using LibHac.Tools.FsSystem.NcaUtils;
 using LibHac.Tools.FsSystem.RomFs;
+using LibHac.Tools.Ncm;
+using LibHac.Ncm;
+using ContentType = LibHac.Ncm.ContentType;
 using Path = System.IO.Path;
 
 static class P {
@@ -24,14 +31,18 @@ static class P {
 
     static int Main(string[] a) {
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
-        if (a.Length < 4) { Console.Error.WriteLine("用法 | usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
+        if (a.Length >= 3 && a[1] == "--list") return List(ExternalKeyReader.ReadKeyFile(a[0]), a[2]);
+        if (a.Length < 4) { Console.Error.WriteLine("用法 | usage: nx_extract <prod.keys> <base.nsp|.xci> <update.nsp|.xci|-> <out dir> [base RomFS dir] [--manifest]\n       nx_extract <prod.keys> --aoc <dlc.nsp|.xci> <out dir> [DLC title ID]\n       nx_extract <prod.keys> --list <file.nsp|.xci>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
-        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
-        var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
-        Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("基础 NSP 里没有程序 NCA | no Program NCA in the base NSP");
-        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program) ?? throw new Exception("更新 NSP 里没有程序 NCA | no Program NCA in the update NSP");
-        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control);
-        Console.WriteLine($"标题 | title {baseProg.Header.TitleId:x16}" + (updProg != null ? $"，更新 | update {updProg.Header.TitleId:x16}" : ""));
+        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], a.Length > 4 ? Convert.ToUInt64(a[4], 16) : 0);
+        var basePkg = OpenPkg(ks, a[1]); var updPkg = a[2] == "-" ? null : a[2] == a[1] ? basePkg : OpenPkg(ks, a[2]);
+        Content baseC = Best(basePkg, ContentMetaType.Application, 0) ?? throw new Exception("基础包里没有本体（Application）| no base game (Application) in the base package");
+        Content updC = updPkg == null ? null : Best(updPkg, ContentMetaType.Patch, 0) ?? throw new Exception("更新包里没有更新（Patch）| no update (Patch) in the update package");
+        Nca baseProg = baseC.Get(ContentType.Program) ?? throw new Exception("本体里没有程序 NCA | no Program NCA in the base game");
+        Nca updProg = updC == null ? null : updC.Get(ContentType.Program) ?? throw new Exception("更新里没有程序 NCA | no Program NCA in the update");
+        if (updC != null) Console.WriteLine($"更新版本号 | update version v{updC.Version}");
+        Nca ctrl = (updC ?? baseC).Get(ContentType.Control);
+        Console.WriteLine($"标题 | title {baseC.Id:x16}" + (updC != null ? $"，更新 | update {updC.Id:x16}" : ""));
         string outDir = a[3], cmpDir = a.Length > 4 ? a[4] : null;
         if (ctrl != null) {   // control data (NACP): display version and game name; a raw copy goes to <output dir>/control.nacp for naming the app
             byte[] nacp = Nacp(ctrl);
@@ -57,21 +68,34 @@ static class P {
         return 0;
     }
 
-    // DLC NSP: one data NCA (content type PublicData / Data) + a meta NCA + the ticket; only the data NCA's RomFS is written
-    static int Aoc(KeySet ks, string nsp, string outDir) {
-        var pkg = OpenNsp(ks, nsp);
-        Nca data = Pick(pkg, NcaContentType.PublicData) ?? Pick(pkg, NcaContentType.Data) ?? throw new Exception("DLC NSP 里没有数据 NCA | no data NCA in the DLC NSP");
+    // DLC NSP: one data NCA (content type PublicData / Data) + a meta NCA + the ticket; only the data NCA's RomFS is written. An XCI can hold several: give the title ID
+    static int Aoc(KeySet ks, string nsp, string outDir, ulong want) {
+        Content c = Best(OpenPkg(ks, nsp), ContentMetaType.AddOnContent, want) ?? throw new Exception("包里没有（这个标题号的）DLC | no DLC (with this title ID) in the package");
+        Nca data = c.Get(ContentType.Data) ?? throw new Exception("DLC 里没有数据 NCA | no data NCA in the DLC");
         Console.WriteLine($"追加内容 | add-on content {data.Header.TitleId:x16}");
         Directory.CreateDirectory(outDir);
         Copy(new RomFsFileSystem(data.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid)), outDir, null);
         return 0;
     }
 
-    // Open an NSP (PFS0), import its common tickets, list all NCAs
-    static List<Nca> OpenNsp(KeySet ks, string path) {
-        var pfs = new PartitionFileSystem();
-        pfs.Initialize(new LocalStorage(path, FileAccess.Read)).ThrowIfFailure();
-        var ncas = new List<Nca>();
+    // One content meta record (CNMT): its type, title ID, version and NCAs by content type
+    sealed class Content {
+        public ContentMetaType Type; public ulong Id; public uint Version; public Dictionary<ContentType, Nca> Ncas = new();
+        public Nca Get(ContentType t) => Ncas.TryGetValue(t, out Nca n) ? n : null;
+    }
+    // The record of that type (and title ID, when not 0) with the highest version: an XCI with an update keeps both versions of each DLC
+    static Content Best(List<Content> l, ContentMetaType t, ulong id) { Content b = null; foreach (Content c in l) if (c.Type == t && (id == 0 || c.Id == id) && (b == null || c.Version > b.Version)) b = c; return b; }
+    // Open an NSP (PFS0) or an XCI (its secure partition, HFS0), import the common tickets, read every content meta record and attach its NCAs (named <content ID>.nca)
+    static List<Content> OpenPkg(KeySet ks, string path) {
+        var storage = new LocalStorage(path, FileAccess.Read);
+        IFileSystem pfs;
+        byte[] magic = new byte[4]; storage.Read(0x100, magic).ThrowIfFailure();
+        if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic sits at 0x100
+            var xci = new Xci(ks, storage);
+            if (!xci.HasPartition(XciPartitionType.Secure)) throw new Exception("XCI 没有安全分区 | the XCI has no secure partition");
+            pfs = xci.OpenPartition(XciPartitionType.Secure);
+        } else { var p = new PartitionFileSystem(); p.Initialize(storage).ThrowIfFailure(); pfs = p; }
+        var ncas = new Dictionary<string, Nca>(StringComparer.OrdinalIgnoreCase);
         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default)) {
             using var f = new UniqueRef<IFile>();
             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
@@ -80,11 +104,33 @@ static class P {
                 byte[] t = new byte[0x2c0]; st.Read(0, t).ThrowIfFailure();
                 if (t[0x281] != 0) { Console.Error.WriteLine($"【红】{e.Name} 不是通用票据，标题密钥要另给 | is not a common ticket; supply the title key separately"); continue; }
                 ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
-            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) ncas.Add(new Nca(ks, st));
+            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) ncas[e.Name.Substring(0, 32)] = new Nca(ks, st);
         }
-        return ncas;
+        var list = new List<Content>();
+        foreach (Nca meta in ncas.Values) {
+            if (meta.Header.ContentType != NcaContentType.Meta) continue;
+            IFileSystem mfs = meta.OpenFileSystem(0, IntegrityCheckLevel.ErrorOnInvalid);
+            foreach (DirectoryEntryEx e in mfs.EnumerateEntries("*.cnmt", SearchOptions.Default)) {
+                using var f = new UniqueRef<IFile>();
+                mfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                var cnmt = new Cnmt(f.Release().AsStream());
+                var c = new Content { Type = cnmt.Type, Id = cnmt.TitleId, Version = cnmt.TitleVersion.Version };
+                foreach (CnmtContentEntry ce in cnmt.ContentEntries)
+                    if (ncas.TryGetValue(Convert.ToHexString(ce.NcaId), out Nca n)) c.Ncas[ce.Type] = n;
+                list.Add(c);
+            }
+        }
+        return list;
     }
-    static Nca Pick(List<Nca> l, NcaContentType t) { foreach (Nca n in l) if (n.Header.ContentType == t) return n; return null; }
+    // Contents of a package: one line per content meta record (type, title ID, version, display version of its control data, content types present)
+    static int List(KeySet ks, string path) {
+        foreach (Content c in OpenPkg(ks, path)) {
+            Nca ctl = c.Get(ContentType.Control); string disp = "";
+            if (ctl != null) try { disp = System.Text.Encoding.ASCII.GetString(Nacp(ctl), 0x3060, 0x10).TrimEnd('\0'); } catch (Exception) { disp = "?"; }
+            Console.WriteLine($"{c.Type}\t{c.Id:x16}\tv{c.Version}\t{disp}\t{string.Join(",", c.Ncas.Keys)}");
+        }
+        return 0;
+    }
 
     // Icon: the control data holds one 256x256 JPEG per language (/icon_<language>.dat). Use the English one (American, then British); if neither exists, take the first in NACP language order
     static readonly string[] IconLangs = { "AmericanEnglish", "BritishEnglish", "Japanese", "French", "German", "LatinAmericanSpanish", "Spanish", "Italian",

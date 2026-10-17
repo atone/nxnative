@@ -124,27 +124,52 @@ def version_of(path):
     return int(m.group(1)) if m else None
 
 
-def scan_nsps(nsp_dir):
-    """Group by game: {application title ID: {'base': path, 'updates': [(version, path)], 'dlc': [(title ID, version, path)]}}"""
+def scan_nsps(nsp_dir, list_xci=None):
+    """Group by game: {application title ID: {'base': path, 'updates': [(version, path)], 'dlc': [(title ID, version, path)]}}.
+    XCI cartridge dumps count too: list_xci(path) gives their contents as (kind, title ID, version) from nx_extract --list; one XCI can be the base, an update and several DLC at once"""
     fams, unknown = {}, []
-    for p in sorted(nsp_dir.glob('*.nsp')):
-        if p.stat().st_size == 0:   # an empty file left by an incomplete download (the Zelda BotW folder holds a 0-byte DLC NSP next to the complete (1).nsp)
-            say(f'跳过空文件 | skipping an empty file: {p.name}'); continue
-        tid = title_of(p)
-        if tid is None: unknown.append(p); continue
+    def add(tid, ver, p):
         low = tid & 0xFFF   # base …000, update …800, DLC = base + 0x1000 + index
         app = tid if low == 0 else tid & ~0xFFF if low == 0x800 else (tid & ~0xFFF) - 0x1000
         f = fams.setdefault(app, {'base': None, 'updates': [], 'dlc': []})
-        if low == 0: f['base'] = p
-        elif low == 0x800: f['updates'].append((version_of(p), p))
-        else: f['dlc'].append((tid, version_of(p), p))
+        if low == 0: f['base'] = f['base'] or p
+        elif low == 0x800: f['updates'].append((ver, p))
+        else: f['dlc'].append((tid, ver, p))
+    for p in sorted([*nsp_dir.glob('*.nsp'), *nsp_dir.glob('*.xci')]):
+        if p.stat().st_size == 0:   # an empty file left by an incomplete download (the Zelda BotW folder holds a 0-byte DLC NSP next to the complete (1).nsp)
+            say(f'跳过空文件 | skipping an empty file: {p.name}'); continue
+        if p.suffix.lower() == '.xci':
+            items = list_xci(p) if list_xci else []
+            for kind, tid, ver in items: say(f'XCI {p.name}：{kind} {tid:016X} v{ver}')
+            for kind, tid, ver in items: add(tid, ver, p)
+            continue
+        tid = title_of(p)
+        if tid is None: unknown.append(p); continue
+        add(tid, version_of(p), p)
     if len(fams) == 1 and len(unknown) == 1 and next(iter(fams.values()))['base'] is None:   # a base game converted from a cartridge may have neither tags nor a ticket; build IDs are checked afterwards
         next(iter(fams.values()))['base'] = unknown[0]
     if not fams: raise BuildError(f'{nsp_dir} 里没有认得出标题号的 NSP | no NSP with a readable title ID in {nsp_dir}')
     if len(fams) > 1: raise BuildError('文件夹里有不止一个游戏，一个文件夹放一个游戏 | more than one game in the folder, keep one game per folder: ' + ', '.join(f'{t:016X}' for t in fams))
     app, fam = next(iter(fams.items()))
-    if fam['base'] is None: raise BuildError(f'{nsp_dir} 里没找到基础版 NSP（标题号 {app:016X}）| no base game NSP found (title ID {app:016X})')
+    if fam['base'] is None: raise BuildError(f'{nsp_dir} 里没找到基础版 NSP / XCI（标题号 {app:016X}）| no base game NSP / XCI found (title ID {app:016X})')
     return app, fam
+
+
+def xci_lister(repo, keys, env):
+    """For folders holding XCI files: nx_extract --list reads their content meta, so a copy of nx_extract is built in a temporary folder first (the work folder is only known once the game is)"""
+    t = Path(tempfile.mkdtemp(prefix='nx_list_'))
+    r = subprocess.run(['dotnet', 'build', str(repo / 'dm/tools/nx_extract'), '-c', 'Release', '-o', str(t), '-v', 'quiet', '-nologo'], env=env, capture_output=True, text=True)
+    if r.returncode or not (t / 'nx_extract').exists(): raise BuildError('编译 nx_extract 失败（读 XCI 清单要用）| building nx_extract (needed to read the XCI contents) failed: ' + (r.stdout + r.stderr).strip()[-300:])
+    kinds = {'Application': 'base', 'Patch': 'update', 'AddOnContent': 'dlc'}
+    def lister(p):
+        r = subprocess.run([str(t / 'nx_extract'), str(keys), '--list', str(p)], env=env, capture_output=True, text=True)
+        if r.returncode: raise BuildError(f'读不出 XCI 清单 | cannot read the XCI contents: {p.name}: ' + r.stderr.strip()[-300:])
+        out = []
+        for ln in r.stdout.splitlines():
+            c = ln.split('\t')
+            if len(c) >= 3 and c[0] in kinds: out.append((kinds[c[0]], int(c[1], 16), int(c[2].lstrip('v'))))
+        return out
+    return lister, t
 
 
 def pick_nsps(fam, versions):
@@ -155,7 +180,7 @@ def pick_nsps(fam, versions):
         if ver == 'v0': out[ver] = (fam['base'], None); continue
         n = int(ver[1:])
         upd = [u for v, u in fam['updates'] if v == n] or [u for v, u in fam['updates'] if v is None and len(fam['updates']) == 1]   # without a version in the file name only a single update is accepted; build IDs are checked afterwards
-        if not upd: raise BuildError(f'没找到更新 {ver} 的 NSP（游戏档案要这些版本：{", ".join(versions)}）| no NSP for update {ver} (the game profile needs these versions: {", ".join(versions)})')
+        if not upd: raise BuildError(f'没找到更新 {ver} 的 NSP / XCI（游戏档案要这些版本：{", ".join(versions)}）| no NSP / XCI for update {ver} (the game profile needs these versions: {", ".join(versions)})')
         say(f'更新 {ver} | update {ver}: {upd[0].name}'); out[ver] = (fam['base'], upd[0])
     return out
 
@@ -315,7 +340,7 @@ def extract_aoc(nx, keys, work, app, fam, logs):
     for tid, (_, p) in sorted(best.items()):
         idx = tid - app - 0x1000
         say(f'DLC 序号 {idx} | DLC index {idx}: {p.name}')
-        run([nx, keys, '--aoc', p, tmp / str(idx)], logs / f'aoc_{idx}.log')
+        run([nx, keys, '--aoc', p, tmp / str(idx), f'{tid:016x}'], logs / f'aoc_{idx}.log')   # the title ID picks the DLC inside an XCI
     swap_in(tmp, work / 'aoc')
     return work / 'aoc'
 
@@ -398,8 +423,14 @@ def main(args=None):
     if not keys.is_file(): raise BuildError(f'没有这个文件 | no such file: {keys}')
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
+    home_dotnet = os.path.expanduser('~/.dotnet')
+    if 'DOTNET_ROOT' not in env and os.path.exists(os.path.join(home_dotnet, 'dotnet')) and not os.path.exists('/usr/local/share/dotnet/dotnet'):
+        env['DOTNET_ROOT'] = home_dotnet   # .NET installed per user (dotnet-install.sh): the nx_extract executable does not find the runtime without it
     py = sys.executable
-    app, fam = scan_nsps(nsp_dir)
+    lister, lister_dir = xci_lister(repo, keys, env) if any(p.stat().st_size for p in nsp_dir.glob('*.xci')) else (None, None)
+    try: app, fam = scan_nsps(nsp_dir, lister)
+    finally:
+        if lister_dir: rmtree(lister_dir)
     g = gamemod.by_title(app)
     if g is None:   # no game profile: survey only
         missing = [m for m in ('lz4.block', 'capstone') if not _importable(m)]

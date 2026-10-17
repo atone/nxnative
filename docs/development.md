@@ -145,7 +145,7 @@ Record on the game version you ship. At launch the log names each list it read a
 
 | Tool | What it does |
 |---|---|
-| `nx_extract/` | NSP → ExeFS / RomFS / icon with LibHac, merging an update over the base game (C#, `dotnet build`). `--manifest` writes ExeFS and a RomFS file list only, for surveys |
+| `nx_extract/` | NSP or XCI → ExeFS / RomFS / icon with LibHac, merging an update over the base game (C#, `dotnet build`). Contents are picked by their content meta records, so one XCI can serve as base, update and DLC; `--list` prints those records (type, title ID, version). `--manifest` writes ExeFS and a RomFS file list only, for surveys |
 | `nso_fnmap.py` | Carries offsets from one build to another (function matching with addresses masked; globals via their references) |
 | `nso2elf.py` | Converts NSO to ELF for Ghidra / REA |
 | `insn_census.py` | Counts the instruction sites the rewriter must handle |

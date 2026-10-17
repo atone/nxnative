@@ -56,6 +56,8 @@ python3 -m pip install lz4 capstone fonttools
   Super Mario Bros. Wonder [010015100B514800][v327680].nsp
 ```
 
+A cartridge dump (XCI) works as well, also one that already holds the update and DLC; if its update is not the version the table lists, put that update's NSP next to it.
+
 **3. Run the script:**
 
 ```
@@ -158,6 +160,8 @@ python3 -m pip install lz4 capstone fonttools
   Super Mario Bros. Wonder [010015100B514000][v0].nsp
   Super Mario Bros. Wonder [010015100B514800][v327680].nsp
 ```
+
+卡带镜像（XCI）也可以，里面已经带着更新和 DLC 的也行；如果它带的更新不是表里写的版本，就把那个版本的更新 NSP 放在旁边。
 
 **3. 运行脚本：**
 
