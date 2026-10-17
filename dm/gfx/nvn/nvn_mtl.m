@@ -2101,7 +2101,7 @@ static void shmap_load(void) {
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
-    NSString *fv_key; uint32_t fv_locs; NvShader *fv; int fv_tried; } @end   // fv: float-input variant <key>_bv of a vertex shader whose fv_locs inputs are declared as integers (see vs_for_formats)
+    NSString *fv_key; uint32_t fv_locs; NvShader *fv; int fv_tried; NSMutableDictionary<NSNumber *, NvShader *> *fv_mix; } @end   // fv: float-input variant <key>_bv of a vertex shader whose fv_locs inputs are declared as integers; fv_mix: mixed declarations by integer-location mask (see vs_for_formats)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
 @interface NvProg : NSObject { @public NvShader *sh[6]; } @end
@@ -2709,19 +2709,47 @@ static int vfmt_int(MTLVertexFormat f) {
     }
 }
 static NvShader *shader_load(NSString *pc, int stage);
+// Mixed: in one draw some of those inputs get integer formats (bone indices, RG8UI) and others float ones. Built from the variant's MSL (shipped next to the libraries): the integer locations are declared uint4
+// again and read through as_type<float4>, so the float-declared code sees the same bits (Link's Awakening: the canopy of the tree behind Marin's house, whose bone indices read as floats, flew off). Cached by mask
+static NvShader *vs_mixed(NvShader *fv, NSString *name, uint32_t imask) {
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.metal", g_msl_dir, name] encoding:NSUTF8StringEncoding error:nil];
+    if (!src) return nil;
+    NSMutableString *m = [src mutableCopy];
+    for (int l = 0; l < 32; l++) if (imask >> l & 1) {
+        NSRegularExpression *decl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 (m_\\d+) \\[\\[attribute\\(%d\\)\\]\\]", l] options:0 error:nil];
+        NSTextCheckingResult *r = [decl firstMatchInString:m options:0 range:NSMakeRange(0, m.length)]; if (!r) continue;
+        NSString *name = [m substringWithRange:[r rangeAtIndex:1]];
+        [m replaceCharactersInRange:r.range withString:[NSString stringWithFormat:@"uint4 %@ [[attribute(%d)]]", name, l]];
+        NSRegularExpression *use = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\bin\\.%@\\b", name] options:0 error:nil];
+        [use replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:[NSString stringWithFormat:@"as_type<float4>(in.%@)", name]];
+    }
+    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:m options:nil error:&e];
+    id<MTLFunction> fn = [lib newFunctionWithName:fv->fn.name];
+    if (!fn) { MLOG("【红】顶点着色器 %s 的混合输入版本编不出：%s", fv->key, e.localizedDescription.UTF8String); return nil; }
+    NvShader *o = [NvShader new]; o->fn = fn; o->rf = fv->rf; o->stage = fv->stage; strlcpy(o->key, fv->key, sizeof o->key);
+    for (int v = 0; v < o->rf.nv; v++) if (imask >> o->rf.v[v].loc & 1) o->rf.v[v].ct = NVN_CT_UINT;
+    return o;
+}
 static NvShader *vs_for_formats(NvShader *vs, const pso_key *k) {
     if (!vs->fv_key) return vs;
-    const nvn_refl *rf = &vs->rf; int want = 0;
-    for (int v = 0; v < rf->nv && !want; v++) if (vs->fv_locs >> rf->v[v].loc & 1) {
+    const nvn_refl *rf = &vs->rf; uint32_t fmask = 0, imask = 0;
+    for (int v = 0; v < rf->nv; v++) if (vs->fv_locs >> rf->v[v].loc & 1) {
         int a = rf->v[v].nvn; MTLVertexFormat f = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
-        if (f != MTLVertexFormatInvalid && !vfmt_int(f)) want = 1;
+        if (f == MTLVertexFormatInvalid) continue;
+        if (vfmt_int(f)) imask |= 1u << rf->v[v].loc; else fmask |= 1u << rf->v[v].loc;
     }
-    if (!want) return vs;
+    if (!fmask) return vs;
     pthread_mutex_lock(&g_fv_mu);
     if (!vs->fv_tried) { vs->fv_tried = 1; vs->fv = shader_load(vs->fv_key, 0); MLOG("顶点着色器 %s 有浮点输入的绘制：用变体 %s%s", vs->key, vs->fv_key.UTF8String, vs->fv ? "" : "（加载失败）"); }
-    NvShader *fv = vs->fv;
+    NvShader *r = vs->fv;
+    if (r && imask) {
+        if (!vs->fv_mix) vs->fv_mix = [NSMutableDictionary dictionary];
+        NvShader *mx = vs->fv_mix[@(imask)];
+        if (!mx) { mx = vs_mixed(r, vs->fv_key, imask); if (mx) { vs->fv_mix[@(imask)] = mx; MLOG("顶点着色器 %s：整数位置 %#x、浮点位置 %#x 混用，现编混合版本", vs->key, imask, fmask); } }
+        if (mx) r = mx;
+    }
     pthread_mutex_unlock(&g_fv_mu);
-    return fv ? fv : vs;
+    return r ? r : vs;
 }
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];

@@ -108,7 +108,7 @@ def cache_outputs(key, digest, cached=False):
     root = cache_path(digest); files = {}
     for label, directory, names in (
             ('mac', out, [key + '_b.metallib', key + '_b.metal', key + '_b.json', key + '_bv.metallib', key + '_bv.metal', key + '_bv.json']),
-            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json', key + '_bv.metallib', key + '_bv.json'])):
+            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json', key + '_bv.metallib', key + '_bv.metal', key + '_bv.json'])):
         if not directory: continue
         base = os.path.join(root, label) if cached else directory
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
@@ -553,7 +553,9 @@ def float_variant(key, w, src_f, refl, extra):
     Metal 不许 uint 输入配浮点格式，管线建不出、这次绘制不画（织梦岛树冠的深度预渲染：树只剩树干）。这里把浮点声明的第一遍也编出来，宿主按实际格式选（nvn_mtl.m pso_desc）。
     The float variant <key>_bv of a shader with integer inputs: int_inputs re-declares inputs used only as bits as uint, which draws feeding integer formats (bone indices) need; other draws of the same shader
     feed Half / normalized formats, which Metal will not pair with a uint input, so the pipeline failed and the draw was dropped (Link's Awakening's tree canopy depth prepass: trees kept only their trunks).
-    The float-declared first pass is built as well and the host picks by the actual formats (nvn_mtl.m pso_desc). Returns an error tuple, or None"""
+    The float-declared first pass is built as well and the host picks by the actual formats (nvn_mtl.m pso_desc). Returns an error tuple, or None
+    一次绘制里也会有的输入喂整数（骨骼索引 RG8UI）、有的喂浮点：宿主从随库带上的这份 MSL 现编那种组合（整数的那几个改回 uint 声明），所以 iOS 也带 .metal。
+    One draw can also feed some of these inputs integers (bone indices, RG8UI) and others floats: the host compiles that combination from this MSL shipped with the libraries (the integer ones declared uint again), so iOS gets the .metal too."""
     msl = os.path.join(w, key + '_bv.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_bv.metallib')
     open(msl, 'w').write(src_f)
     try:
@@ -565,6 +567,7 @@ def float_variant(key, w, src_f, refl, extra):
         ilib = os.path.join(IOSOUT, key + '_bv.metallib')
         try: ios_metal.compile(msl, msl[:-6] + '.ios.air', ilib + '.tmp'); os.replace(ilib + '.tmp', ilib)
         except subprocess.CalledProcessError as e: return '浮点变体 iOS metal 失败', str(e)[:160], None
+        clone(msl, os.path.join(IOSOUT, key + '_bv.metal'))
     refl['float_variant'] = {'key': key + '_bv', 'locations': sorted(int(l) for l in extra)}
     vr = dict(refl, key=key + '_bv', vertex_inputs=[{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src_f)])
     vr.pop('float_variant')
