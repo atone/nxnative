@@ -107,8 +107,8 @@ def cache_path(digest): return os.path.join(CAS, 'shader', digest)
 def cache_outputs(key, digest, cached=False):
     root = cache_path(digest); files = {}
     for label, directory, names in (
-            ('mac', out, [key + '_b.metallib', key + '_b.metal', key + '_b.json']),
-            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json'])):
+            ('mac', out, [key + '_b.metallib', key + '_b.metal', key + '_b.json', key + '_bv.metallib', key + '_bv.metal', key + '_bv.json']),
+            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json', key + '_bv.metallib', key + '_bv.json'])):
         if not directory: continue
         base = os.path.join(root, label) if cached else directory
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
@@ -480,17 +480,33 @@ def vs_pad(key, src):
     k = src.find('main0_out out = {};') + len('main0_out out = {};')
     return src[:k] + ''.join(f'\n    out.dm_pad{l} = float4(0.0, 0.0, 0.0, 1.0);' for l in miss) + src[k:], miss
 
+def vs_defaults(src):
+    """顶点着色器的每个 4 分量输出先置 (0,0,0,1)，之后实际写到的分量照常覆盖。
+    Maxwell 上顶点没写的输出分量读到的是缺省值 (0,0,0,1)；MSL 的 main0_out out = {} 全置 0。织梦岛的场景顶点着色器只写世界坐标的 xyz，像素着色器拿 w 当齐次坐标去除：
+    w = 0 让阴影坐标成了无穷大，村子大片落在「阴影」里（整份画面像阴天）。vs_pad 只补整个没写的位置，这里补写了一部分的。
+    Every 4-component output of a vertex shader starts as (0,0,0,1); the components actually written overwrite it as before.
+    On Maxwell a pixel shader reading an output component the vertex shader did not write gets the default (0,0,0,1); MSL's main0_out out = {} zeroes everything. Link's Awakening's scene vertex shaders
+    write only xyz of the world position and the pixel shader divides by w: w = 0 sent the shadow coordinates to infinity and put most of the village "in shadow" (the whole picture looked overcast).
+    vs_pad covers locations not written at all; this covers the partly written ones."""
+    i = src.find('struct main0_out\n{\n'); j = src.find('\n};', i); k = src.find('main0_out out = {};')
+    if i < 0 or j < 0 or k < 0: return src
+    outs = re.findall(r'\n\s*(float4|int4|uint4) (\w+) \[\[user\(locn\d+\)\]\]', src[i:j])
+    if not outs: return src
+    k += len('main0_out out = {};')
+    return src[:k] + ''.join(f'\n    out.{n}.w = 1.0;' if t == 'float4' else f'\n    out.{n}.w = as_type<{t[:-1]}>(1.0f);' for t, n in outs) + src[k:]
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     msl = os.path.join(w, key + '.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_b.metallib')
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
-    src = open(msl).read()
+    src = open(msl).read(); src_f = None
     if j['stage'] == 'vs':   # 第二遍：只按整数用的输入改报 uint 重新翻译（见 int_inputs） | second pass: re-translate with inputs that are only used as integers reported as uint (see int_inputs)
         extra = {l: t for l, t in int_inputs(src).items() if l not in j['attr']}
         if extra:
             j['attr'].update(extra); jp = os.path.join(w, f'job1_{key}.json'); json.dump([j], open(jp, 'w'))
             rx = subprocess.run([XLATE, jp, w], capture_output=True, text=True)
+            src_f = src   # 浮点声明的第一遍留作变体 <key>_bv（见 float_variant） | the float-declared first pass is kept as the variant <key>_bv (see float_variant)
             if rx.returncode or not os.path.exists(os.path.join(w, key + '.spv')): return '翻译失败', ('整数输入重翻：' + rx.stderr.strip())[:160], None
             r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
             if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
@@ -498,7 +514,10 @@ def finish(key, w, j, c1):
     pad = []
     if j['stage'] == 'vs' and PAIRS.get(key):   # 像素着色器读而顶点没写的输出补成 (0,0,0,1)（见 vs_pad） | outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
         src, pad = vs_pad(key, src)
-        if pad: open(msl, 'w').write(src)
+        if src_f: src_f, _ = vs_pad(key, src_f)
+    if j['stage'] == 'vs':
+        src = vs_defaults(src); open(msl, 'w').write(src)
+        if src_f: src_f = vs_defaults(src_f)
     res = json.load(open(os.path.join(w, key + '.res.json')))
     try:
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
@@ -522,9 +541,35 @@ def finish(key, w, j, c1):
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src), 'vs_pad': pad}
+    if src_f:
+        st = float_variant(key, w, src_f, refl, extra)
+        if st: return st
     write_refl(key, refl)
     fetch_finish(key, src, refl)
     return 'ok', '', refl
+
+def float_variant(key, w, src_f, refl, extra):
+    """整数输入的浮点变体 <key>_bv：int_inputs 把只按位用的输入改报 uint，喂整数格式（骨骼索引）的绘制靠它；可同一个着色器的别的绘制喂 Half / 归一化格式，
+    Metal 不许 uint 输入配浮点格式，管线建不出、这次绘制不画（织梦岛树冠的深度预渲染：树只剩树干）。这里把浮点声明的第一遍也编出来，宿主按实际格式选（nvn_mtl.m pso_desc）。
+    The float variant <key>_bv of a shader with integer inputs: int_inputs re-declares inputs used only as bits as uint, which draws feeding integer formats (bone indices) need; other draws of the same shader
+    feed Half / normalized formats, which Metal will not pair with a uint input, so the pipeline failed and the draw was dropped (Link's Awakening's tree canopy depth prepass: trees kept only their trunks).
+    The float-declared first pass is built as well and the host picks by the actual formats (nvn_mtl.m pso_desc). Returns an error tuple, or None"""
+    msl = os.path.join(w, key + '_bv.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_bv.metallib')
+    open(msl, 'w').write(src_f)
+    try:
+        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
+        subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', lib + '.tmp'], check=True); os.replace(lib + '.tmp', lib)
+    except subprocess.CalledProcessError as e: return '浮点变体 metal 失败', str(e)[:160], None
+    clone(msl, os.path.join(out, key + '_bv.metal'))
+    if IOSOUT:
+        ilib = os.path.join(IOSOUT, key + '_bv.metallib')
+        try: ios_metal.compile(msl, msl[:-6] + '.ios.air', ilib + '.tmp'); os.replace(ilib + '.tmp', ilib)
+        except subprocess.CalledProcessError as e: return '浮点变体 iOS metal 失败', str(e)[:160], None
+    refl['float_variant'] = {'key': key + '_bv', 'locations': sorted(int(l) for l in extra)}
+    vr = dict(refl, key=key + '_bv', vertex_inputs=[{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src_f)])
+    vr.pop('float_variant')
+    for d, rec in ((out, MAC_RECORD),) + (((IOSOUT, ios_metal.RECORD),) if IOSOUT else ()): atomic_json(os.path.join(d, key + '_bv.json'), dict(vr, chain_metal=rec))
+    return None
 
 keys = sorted(want) if want else sorted(loc)
 NJ = int(os.environ.get('J', '8'))

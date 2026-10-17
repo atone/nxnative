@@ -2100,7 +2100,8 @@ static void shmap_load(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
-    id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib: readable-tile version <key>_bf (merge B step 2)
+    id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
+    NSString *fv_key; uint32_t fv_locs; NvShader *fv; int fv_tried; } @end   // fv: float-input variant <key>_bv of a vertex shader whose fv_locs inputs are declared as integers (see vs_for_formats)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
 @interface NvProg : NSObject { @public NvShader *sh[6]; } @end
@@ -2236,6 +2237,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
+    { NSDictionary *fv = j[@"float_variant"]; if ([fv isKindOfClass:[NSDictionary class]] && [fv[@"key"] isKindOfClass:[NSString class]]) { o->fv_key = fv[@"key"]; for (NSNumber *l in fv[@"locations"]) if (l.intValue < 32) o->fv_locs |= 1u << l.intValue; } }
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
         int max_aid = -1;
@@ -2655,7 +2657,7 @@ static MTLVertexFormat vfmt_for_ct(MTLVertexFormat f, int ct, int nvn_fmt) {
     for (int i = 0; i < 4; i++) if (F[i] == f) iff = i;
     if (ct == NVN_CT_UINT) { if (iu >= 0) return f; if (ii >= 0) return U[ii]; if (iff >= 0) return U[8 + iff]; }
     else if (ct == NVN_CT_INT) { if (ii >= 0) return f; if (iu >= 0) return I[iu]; if (iff >= 0) return I[8 + iff]; }
-    else { if (iu < 0 && ii < 0) return f; }
+    else { if (iu < 0 && ii < 0) return f; if (iu >= 8) return F[iu - 8]; if (ii >= 8) return F[ii - 8]; }   // float input, 32-bit integer format: fetched as float, the shader's bit casts get the integer back (bits unchanged, denormals included; checked on Apple GPUs)
     RED_ONCE(66, "顶点属性格式 %#x 与着色器输入类型 %s 对不上，位模式保不住（照原格式）", nvn_fmt, ct == NVN_CT_UINT ? "uint" : ct == NVN_CT_INT ? "int" : "float");
     return f;
 }
@@ -2694,9 +2696,37 @@ static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
+// A vertex shader whose inputs int_inputs re-declared as integers (dmsh_build.py) also has a float-declared variant <key>_bv. Metal pairs integer inputs only with integer formats, but the same shader can be fed
+// integer data (bone indices) in some draws and Half / normalized data in others, where Maxwell just moves the bits. When one of those inputs is bound to a non-integer format, the pipeline uses the variant
+// (Link's Awakening's tree canopy depth prepass: the pipeline failed and trees kept only their trunks). Loaded on first need; may run on the warm-up thread, hence the lock
+static pthread_mutex_t g_fv_mu = PTHREAD_MUTEX_INITIALIZER;
+static int vfmt_int(MTLVertexFormat f) {
+    switch (f) {
+        case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4: case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4:
+        case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4: case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
+        case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4: case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4: return 1;
+        default: return 0;
+    }
+}
+static NvShader *shader_load(NSString *pc, int stage);
+static NvShader *vs_for_formats(NvShader *vs, const pso_key *k) {
+    if (!vs->fv_key) return vs;
+    const nvn_refl *rf = &vs->rf; int want = 0;
+    for (int v = 0; v < rf->nv && !want; v++) if (vs->fv_locs >> rf->v[v].loc & 1) {
+        int a = rf->v[v].nvn; MTLVertexFormat f = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
+        if (f != MTLVertexFormatInvalid && !vfmt_int(f)) want = 1;
+    }
+    if (!want) return vs;
+    pthread_mutex_lock(&g_fv_mu);
+    if (!vs->fv_tried) { vs->fv_tried = 1; vs->fv = shader_load(vs->fv_key, 0); MLOG("顶点着色器 %s 有浮点输入的绘制：用变体 %s%s", vs->key, vs->fv_key.UTF8String, vs->fv ? "" : "（加载失败）"); }
+    NvShader *fv = vs->fv;
+    pthread_mutex_unlock(&g_fv_mu);
+    return fv ? fv : vs;
+}
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vs->fn; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
+    NvShader *vsv = vs_for_formats(vs, k);   // the vertex function and its input types; bindings are the same in both
+    d.vertexFunction = vsv->fn; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
     if (fs) { static char keys[6][24]; static int nk = -1; static id<MTLLibrary> hl;
         if (nk < 0) { nk = 0; const char *e = getenv("DM_NVN_HILITE");
@@ -2732,7 +2762,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->dfmt; d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->sfmt;
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-    const nvn_refl *rf = &vs->rf;
+    const nvn_refl *rf = &vsv->rf;
     for (int v = 0; v < rf->nv; v++) {
         int loc = rf->v[v].loc, a = rf->v[v].nvn;   // Metal slot loc ← NVN attribute a
         MTLVertexFormat vf = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
