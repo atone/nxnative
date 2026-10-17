@@ -140,6 +140,13 @@ static void au_open(aout *a) {
     if (AudioUnitSetProperty(a->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f) ||
         AudioUnitSetProperty(a->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb) ||
         AudioUnitInitialize(a->au)) die("AudioUnit 设置失败");
+#if !TARGET_OS_IPHONE
+    // 6 channels (Switch order: front L R, center, LFE, back L R) on a stereo device: without a layout the output unit maps channels 1:1 and drops center / LFE / back;
+    // tagged as 5.1 (after the stream format, which must already have 6 channels) it downmixes them (Link's Awakening's movie sound and its Vorbis 5.1 track)
+    if (a->ch == 6) { AudioChannelLayout l = {.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_A};
+        OSStatus st = AudioUnitSetProperty(a->au, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0, &l, sizeof l);
+        if (st) LOG("【红】audio 5.1 声道布局设不上：状态 %d", (int)st); }
+#endif
 }
 // Silent sink: consumes in real time at 48 kHz every 5 ms. When more than 100 ms behind (iOS suspended the whole process in the background, SIGSTOP on the Mac), restart the count from now and do not make up the missed time --
 // making it up would pull hundreds of times in one go (seconds' worth), releasing all of the game's buffers and logging hundreds of underruns; a suspended console does not play that stretch either

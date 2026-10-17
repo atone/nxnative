@@ -9,7 +9,7 @@
 //   3. Takes over AudioRendererImpl::ExecuteAudioRendererRendering (reached through the PLT): generates commands and runs CommandListProcessor like the original,
 //      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and clamps its input mix buffers (int32 holding 16-bit range) to int16 stereo for AudioOut (hle_audio.c).
 // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
-//   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
+//   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13; 0x10 in SDK 8, 0x14 in SDK 20), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
@@ -98,6 +98,14 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "关渲
 // DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44, same layout: 0x148 bytes,
 //   +0x128 upsample buffer, +0x130 input count, +0x134 input indices). render_once sets it by layout
 static int g_sink_id = 0x13;
+// SDK 8 (Link's Awakening) numbers DeviceSink 0x10 (same 0x148-byte layout). Where the SDK exports CommandBuffer::GenerateDeviceSinkCommand, it builds the header
+// (0xcafebabe | enabled << 32 | ID << 40 | size << 48) with a movk chain: SDK 8 has "movk xN, #0xcafe, lsl #16" then "movk xN, #0x1001, lsl #32". The ID is read from there; def when the pattern is absent
+static int sink_id_from_sdk(int def) {
+    const uint32_t *f = guest_sym("_ZN2nn5audio6server13CommandBuffer25GenerateDeviceSinkCommandEiPKNS1_12SinkInfoBaseEjmj");
+    for (int i = 1; f && i < 64; i++)
+        if ((f[i] & 0xffe00000u) == 0xf2c00000u && (f[i - 1] & 0xffe00000u) == 0xf2a00000u && (f[i - 1] >> 5 & 0xffff) == 0xcafe) return f[i] >> 13 & 0xff;
+    return def;
+}
 static int capture(const uint8_t *cl, int16_t *dst) {
     uint32_t ncmd = *(const uint32_t *)(cl + 4), samples = *(const uint32_t *)(cl + 0x14), rate = *(const uint32_t *)(cl + 0x18);
     const int32_t *mix = *(const int32_t *const *)(cl + 8);
@@ -158,8 +166,8 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
             cbuf = gsym("_ZNK2nn5audio6server17AudioRenderSystem26GetCommandBufferWorkBufferEv"); cbsz = gsym("_ZNK2nn5audio6server17AudioRenderSystem30GetCommandBufferWorkBufferSizeEv");
             gen = gsym("_ZN2nn5audio6server17AudioRenderSystem15GenerateCommandEPvm");
         }
-        mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : 0x13;
-        LOG("audren：AudioRenderSystem 按 SDK %s 布局（更新锁 +%#zx）", gen20 ? "20" : "16", mu_off);
+        mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : sink_id_from_sdk(0x13);
+        LOG("audren：AudioRenderSystem 按 SDK %s 布局（更新锁 +%#zx，DeviceSink 命令号 %#x）", gen20 ? "20" : "16", mu_off, g_sink_id);
         tmax = gsym("_ZN2nn5audio3dsp20CommandListProcessor17SetProcessTimeMaxEj"); setup = gsym("_ZN2nn5audio3dsp20CommandListProcessor5SetupEPKvm");
         process = gsym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
     }
