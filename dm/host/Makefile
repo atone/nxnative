@@ -48,7 +48,7 @@ $(GAME_H): $(GAME_DIR)/game.tsv ../games/game.py
 # Records which game the host was built for: changing GAME changes the stamp's content and rebuilds the host (otherwise make sees dmhost as newer than both headers and keeps the other game's host)
 GAME_STAMP = gen/game.stamp
 $(GAME_STAMP): FORCE
-	@mkdir -p gen; echo $(GAME) | cmp -s - $@ || echo $(GAME) > $@
+	@mkdir -p gen; echo $(GAME) | cmp -s - $@ || { echo $(GAME) > $@; rm -f dmhost; }   # another game: drop the old host (make's one-second timestamps let a quick switch look up to date)
 .PHONY: FORCE
 FORCE:
 dmhost: $(SRC) $(GFX) dm.h hle.h dm_input.h front.h touch_mac.h ../ios/Sources/dm_touch_controls.[ch] $(GFX_H) $(GAME_H) $(GAME_DIR)/dmsh_chain.h $(GAME_STAMP) $(VPX_LIB) ../third_party/stb_vorbis/stb_vorbis.c
