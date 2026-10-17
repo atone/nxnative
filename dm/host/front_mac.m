@@ -1,7 +1,10 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−.
+// Physical controllers (GameController, e.g. a Switch Pro Controller over Bluetooth) work alongside the keyboard. Face buttons map by the letter the system reports for them
+// (macOS names a Switch Pro Controller's buttons by their printed letters: buttonA is the right one), by position (right A, bottom B, top X, left Y, as in DmGamepad.m) when it reports none.
 #import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #include "dm.h"
@@ -40,6 +43,35 @@ static int key_bit(unsigned short code) {
     }
     return -1;
 }
+// Physical controllers -> dm_pad_set (ORed with the keyboard in hle_hid.c). Same reading as DmGamepad.m's read_pad; the last controller that changed wins
+static int32_t pad_axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * DM_STICK_MAX); }
+static uint64_t face_bit(GCControllerButtonInput *b, uint64_t by_pos) {   // the letter in the button's symbol ("a.circle" …), else the position mapping
+    NSString *s = b.sfSymbolsName; unichar c = s.length >= 2 && [s characterAtIndex:1] == '.' ? [s characterAtIndex:0] : 0;
+    return c == 'a' ? DM_BTN_A : c == 'b' ? DM_BTN_B : c == 'x' ? DM_BTN_X : c == 'y' ? DM_BTN_Y : by_pos;
+}
+static void read_pad(GCExtendedGamepad *g) {
+    uint64_t m = 0;
+    #define K(btn, bit) if (btn.isPressed) m |= bit
+    K(g.buttonA, face_bit(g.buttonA, DM_BTN_B)); K(g.buttonB, face_bit(g.buttonB, DM_BTN_A)); K(g.buttonX, face_bit(g.buttonX, DM_BTN_Y)); K(g.buttonY, face_bit(g.buttonY, DM_BTN_X));
+    K(g.leftShoulder, DM_BTN_L); K(g.rightShoulder, DM_BTN_R); K(g.leftTrigger, DM_BTN_ZL); K(g.rightTrigger, DM_BTN_ZR);
+    K(g.buttonMenu, DM_BTN_PLUS); if (g.buttonOptions) K(g.buttonOptions, DM_BTN_MINUS);
+    if (g.leftThumbstickButton) K(g.leftThumbstickButton, DM_BTN_LS); if (g.rightThumbstickButton) K(g.rightThumbstickButton, DM_BTN_RS);
+    K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
+    #undef K
+    dm_pad_set(m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
+}
+static void pads_changed(void) {
+    int any = 0;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
+        GCExtendedGamepad *e = c.extendedGamepad;
+        if (!e.valueChangedHandler) LOG("手柄已连接：%s（%s），面键符号 buttonA=%s buttonB=%s buttonX=%s buttonY=%s", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?",
+                                        e.buttonA.sfSymbolsName.UTF8String ?: "-", e.buttonB.sfSymbolsName.UTF8String ?: "-", e.buttonX.sfSymbolsName.UTF8String ?: "-", e.buttonY.sfSymbolsName.UTF8String ?: "-");
+        any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
+        read_pad(c.extendedGamepad);
+    }
+    if (!any) dm_pad_set(0, 0, 0, 0, 0);   // last one removed: release everything it held
+}
+
 static void on_key(NSEvent *e, int down) {
     unsigned short c = e.keyCode;
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
@@ -75,6 +107,10 @@ void front_run(void (*guest)(void)) {
         [win center];
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        NSNotificationCenter *pc = NSNotificationCenter.defaultCenter;
+        [pc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; pads_changed(); }];
+        [pc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; LOG("手柄已断开"); pads_changed(); }];
+        pads_changed();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
