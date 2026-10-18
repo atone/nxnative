@@ -29,7 +29,7 @@ All of these are tested on an iPhone and playable:
 | Metroid Dread | base game + update 2.1.0 | ~5 GB | |
 | 13 Sentinels: Aegis Rim | base game + update 1.10 | ~5 GB | |
 | Super Mario 3D World + Bowser's Fury | base game + update 1.2.2 | ~3 GB | |
-| The Legend of Zelda: Breath of the Wild | base game + update 1.9.0 (+ DLC) | ~16 GB | 30 fps as on Switch (60 fps opt-in, see the development notes) |
+| The Legend of Zelda: Breath of the Wild | base game + update 1.9.0 (+ DLC) | ~16 GB | Upgraded to 60 fps (30 fps on Switch) |
 | The Legend of Zelda: Link's Awakening | base game + update 1.1.0 | ~6 GB | |
 
 Being ported: Super Mario Odyssey (base game + update 1.4.1) and Hades (base game + update 1.0.38233). Both play on the Mac; their iPhone builds are not tested yet, and the script cannot pack Hades yet.

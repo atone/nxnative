@@ -140,9 +140,6 @@ CUTS = {
   '8c08b9719e085f91847b5e0f935d9488': [
     (0x32f92d4, 'f303002a', '33008052', 'QualitySettings.set_vSyncCount 包装：参数 mov w19,w0 → mov w19,#1（游戏自己的 60 帧路径）', '仅宿主'),
   ],
-  # Opt-in since the game was measured at both rates (DM_BOTW_60FPS=1 when patching, dropped from CUTS below otherwise): only what runs on ksys::VFR keeps its speed at 60 fps.
-  # Systems that count frames run twice as fast: cutscenes (the Great Plateau tower rising) end while their sound plays on, and the menus' stick repeat halves
-  # (weapon wheel, full tilt: 0.3 s moves 4 slots at 60 fps, 2 at 30). Native 30 fps is the default.
   # The Legend of Zelda: Breath of the Wild 1.9.0 (v1114112) main: 60 fps. The main loop of sead::GameFrameworkNx (main+0x112660c) runs a dynamic interval (framework +0x267 = 1):
   # every frame it computes how many vsyncs the last frame needed (rounded up), clamped to [2, max 3] (the max comes from the interval controller +0xc, constructed at main+0x1126c04); it steps up after 3 overrunning frames in a row,
   # steps down one level every 6 frames until 2, and hands the result through setWaitVsyncInterval (vtable +0x130, main+0x11269b8) to presentation (nvnWindowSetPresentInterval).
@@ -175,7 +172,6 @@ CUTS = {
 }
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
-if not os.environ.get('DM_BOTW_60FPS'): CUTS.pop('cd57b23fa4bbad65803d9788c01821ee', None)   # Breath of the Wild 1.9.0 60 fps: opt-in (see above)
 
 OBS = {
   # Metroid Dread 2.1.0 main: the movie player posts "link / unlink holders" requests into the dispatcher thread's request ring (main+0x222cc8) and goes on without waiting for them (after an unlink it frees the wrapper object and builds a new one in place).
