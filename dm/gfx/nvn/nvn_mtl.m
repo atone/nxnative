@@ -1268,6 +1268,22 @@ static int tex_cpu_written(uint64_t serial) {
     pthread_mutex_lock(&g_cpu_tex_mu); int r = g_cpu_tex && CFSetContainsValue(g_cpu_tex, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_cpu_tex_mu);
     return r;
 }
+// The first-use guess below (content already in memory = written by the CPU) is wrong for a texture the GPU writes: its memory still held an earlier owner's data. Breath of the Wild's
+// 1280x720 RGBA8 target used around its pre-rendered cutscenes was guessed CPU-written, and every time its pages changed the host re-uploaded that stale memory over the picture the GPU
+// had drawn: a garbled frame about once a second. Textures attached as render targets or used as copy / clear destinations are recorded (g_gpu_wr): they are never guessed, and one
+// already guessed (g_cpu_guess) keeps its Metal texture and is no longer re-uploaded from memory. Real CPU writes (WriteTexels, the movie decoder) are not affected
+static CFMutableSetRef g_cpu_guess, g_gpu_wr;
+static void tex_gpu_written(const tex_t *t) {
+    if (!t || !t->serial) return;
+    pthread_mutex_lock(&g_cpu_tex_mu);
+    if (!g_gpu_wr) g_gpu_wr = CFSetCreateMutable(NULL, 0, NULL);
+    if (!CFSetContainsValue(g_gpu_wr, (const void *)(uintptr_t)t->serial)) {
+        CFSetAddValue(g_gpu_wr, (const void *)(uintptr_t)t->serial);
+        if (g_cpu_guess && CFSetContainsValue(g_cpu_guess, (const void *)(uintptr_t)t->serial)) MLOG("贴图 ser=%llu %ux%u 格式 %#x：GPU 也写它，不再当 CPU 写的从内存重传", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+    }
+    pthread_mutex_unlock(&g_cpu_tex_mu);
+}
+static int tex_set_has(CFSetRef set, uint64_t serial) { pthread_mutex_lock(&g_cpu_tex_mu); int r = set && CFSetContainsValue(set, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_cpu_tex_mu); return r; }
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
 static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mtl_(ct); AP_E(4); return r; }
 static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
@@ -1281,10 +1297,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     // (upload, and re-upload when its pages change). Surveyed at first use: in Breath of the Wild's village route and Link's Awakening's village this is the only texture that qualifies
     if (!t->has_layout && t->mem && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)
         && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))
-        && t->L.size && !tex_cpu_written(t->serial) && !serial_get(t->serial)) {
+        && t->L.size && !tex_cpu_written(t->serial) && !serial_get(t->serial) && !tex_set_has(g_gpu_wr, t->serial)) {
         const uint64_t *w = (const uint64_t *)t->mem; uint64_t n = t->L.size / 8, i = 0;
         while (i < n && !w[i]) i++;
-        if (i < n) mtl_tex_cpu_written(t);
+        if (i < n) { mtl_tex_cpu_written(t); pthread_mutex_lock(&g_cpu_tex_mu); if (!g_cpu_guess) g_cpu_guess = CFSetCreateMutable(NULL, 0, NULL); CFSetAddValue(g_cpu_guess, (const void *)(uintptr_t)t->serial); pthread_mutex_unlock(&g_cpu_tex_mu); }
     }
     int packaged = (t->has_layout || tex_cpu_written(t->serial)) && t->mem;
     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged)
@@ -1303,6 +1319,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     id have = serial_get(t->serial);
     if (packaged) {
         NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;   // resolved as GPU-only before the CPU wrote it: dropped and rebuilt as packaged
+        if (pk && tex_set_has(g_cpu_guess, t->serial) && tex_set_has(g_gpu_wr, t->serial)) return pk->tex;   // guessed CPU-written, but the GPU writes it (see tex_gpu_written)
         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
             uint64_t now = nvn_dirty_now();
             int tracked = nvn_dirty_tracked(t->mem, t->L.size);
@@ -1794,6 +1811,7 @@ static int rt_dup_slot(const p_set_rt *r, int i) {
     return 0;
 }
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
+    tex_gpu_written(t);
     id<MTLTexture> base = tex_mtl(t); a.texture = base;
     if (base && mtl_fmt_block(base.pixelFormat)) { rt_view_fmt(base, v, has_v); a.texture = nil; return; }   // compressed formats cannot be attached (see rt_view_fmt)
     if (has_v && v->set_levels) a.level = v->base_level;
@@ -5310,7 +5328,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + z * img + y * row, (uint8_t *)buf.contents + z * wb * hb + y * wb, wb);
 }
 static void copy_b2t(const p_copy_b2t *c) {
-    if (c->tex) zskip_del(c->tex->serial);
+    if (c->tex) { zskip_del(c->tex->serial); tex_gpu_written(c->tex); }
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
@@ -5424,7 +5442,7 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
     rp_flush();   // Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
-    if (c->dst) zskip_del(c->dst->serial);
+    if (c->dst) { zskip_del(c->dst->serial); tex_gpu_written(c->dst); }
     if (c->src && c->dst && c->sr.xoffset == 0 && c->sr.yoffset == 0 && c->dr.xoffset == 0 && c->dr.yoffset == 0
         && c->sr.width == (int)c->src->d.width && c->sr.height == (int)c->src->d.height && c->dr.width == (int)c->dst->d.width && c->dr.height == (int)c->dst->d.height) {
         int sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
@@ -5498,7 +5516,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 // Whole level and whole face, all four channels written -> open one clear-only render pass per layer / depth slice (the hardware converts the clear value by the texture format, including integer and depth);
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
-    if (c->tex) zskip_del(c->tex->serial);
+    if (c->tex) { zskip_del(c->tex->serial); tex_gpu_written(c->tex); }
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
