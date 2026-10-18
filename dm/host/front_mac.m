@@ -94,14 +94,14 @@ static void pro_home_led_off(void) {
     LOG("Pro 手柄 HOME 键灯：关（%d 个）", sent);
     IOHIDManagerClose(m, kIOHIDOptionsTypeNone); CFRelease(m); CFRelease(match); CFRelease(v); CFRelease(p);
 }
-// Motion → dm_motion_set, in nn::hid's frame: x left, y backward (towards the player), z up; acceleration in G as the reaction to gravity (lying flat, face up: (0, 0, +1)), angular velocity in
-// revolutions per second (right-handed). DM_PAD_MOTION=<three of x y z, each optionally negated>, e.g. "x,-y,z", remaps both vectors afterwards.
+// Motion → dm_motion_set, in nn::hid's frame. DM_PAD_MOTION=<three of x y z, each optionally negated>, e.g. "x,-y,z", remaps both vectors afterwards.
 // A Switch Pro Controller: GameController reports motion for it but every value stays 0 (gravity a fixed (0, 0, -1)), although the controller streams its IMU in every standard input report
 // (0x30, about 67 a second, three samples each: acceleration and gyro as int16, ±8 G = 4096 LSB/G, ±2000 °/s = 16.4 LSB/(°/s)). Those reports are read directly (IOHIDDevice, opened alongside
 // the system driver). Raw axes, measured with the controller flat, standing on its shoulder edge and on its right grip: x forward (towards the shoulder buttons), y left, z up, acceleration
-// as the reaction to gravity (+1 G up at rest); so hid = (y, −x, z) for both (a rotation about z, the same for acceleration and gyro). Found in Breath of the Wild, where bow aiming follows the gyro
-// and the Sheikah Slate's aim takes its tilt from the accelerometer: with x right / y forward the bow's up and down was reversed (a half turn about z reverses pitch and roll, not yaw), and with
-// acceleration pointing along gravity (flat = (0, 0, -1)) the slate's tilt was right only while its left / right turn was tiny (the game took the controller for upside down). The gyro's resting offset (about 1 °/s) is learned while the controller lies still. Other controllers keep GameController's motion (motion_attach)
+// as the reaction to gravity (+1 G up at rest). nn::hid swaps x and y and reports acceleration along gravity (flat = (0, 0, -1)): gyro (y, x, z), acceleration (-y, -x, -z), in revolutions
+// per second and G. Found in Breath of the Wild, where bow aiming follows the gyro (yaw from z, pitch from x) and the Sheikah Slate's magnesis takes its tilt from the accelerometer (the ratio
+// of its y and z): of the variants tried, only this one had both the bow and magnesis turn the right way up and down. The gyro's resting offset (about 1 °/s) is learned while the controller
+// lies still. Other controllers keep GameController's motion (motion_attach)
 static int g_mmap[3][2] = {{0, 1}, {1, 1}, {2, 1}};
 static void motion_map_init(void) {
     const char *e = getenv("DM_PAD_MOTION"); if (!e) return;
@@ -122,7 +122,7 @@ static void motion_attach(GCController *c) {
         GCAcceleration a = mm.hasGravityAndUserAcceleration ? (GCAcceleration){mm.gravity.x + mm.userAcceleration.x, mm.gravity.y + mm.userAcceleration.y, mm.gravity.z + mm.userAcceleration.z} : mm.acceleration;
         if (a.x == 0 && a.y == 0 && a.z == 0) return;   // no real data (see above)
         GCRotationRate r = mm.rotationRate;
-        double av[3] = {-a.x, -a.y, -a.z}, rv[3] = {r.x / (2 * M_PI), r.y / (2 * M_PI), r.z / (2 * M_PI)};   // GameController reports gravity's direction; nn::hid wants its reaction
+        double av[3] = {a.x, a.y, a.z}, rv[3] = {r.x / (2 * M_PI), r.y / (2 * M_PI), r.z / (2 * M_PI)};   // GameController reports gravity's direction, as nn::hid does
         motion_out(av, rv);
     };
     LOG("手柄体感（GameController）：%s", m.sensorsActive ? "已开" : "没开");
@@ -135,7 +135,7 @@ static void pro_imu_report(void *ctx, IOReturn r, void *sender, IOHIDReportType 
     if (len < 49 || rep[0] != 0x30) return;
     double ra[3] = {0}, rg[3] = {0};
     for (int f = 0; f < 3; f++) { const uint8_t *v = rep + 13 + 12 * f; for (int i = 0; i < 3; i++) { ra[i] += (int16_t)(v[2 * i] | v[2 * i + 1] << 8) / 3.0; rg[i] += (int16_t)(v[6 + 2 * i] | v[7 + 2 * i] << 8) / 3.0; } }
-    double acc[3] = {ra[1] / 4096, -ra[0] / 4096, ra[2] / 4096}, dps[3] = {rg[1] / 16.384, -rg[0] / 16.384, rg[2] / 16.384};
+    double acc[3] = {-ra[1] / 4096, -ra[0] / 4096, -ra[2] / 4096}, dps[3] = {rg[1] / 16.384, rg[0] / 16.384, rg[2] / 16.384};
     // resting offset: while the rate stays within 3 °/s of the current offset and the acceleration is about 1 G for a second, the offset follows the average slowly
     double an = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]), dev = 0;
     for (int i = 0; i < 3; i++) dev = fmax(dev, fabs(dps[i] - g_gbias[i]));
