@@ -27,3 +27,11 @@ void dm_input_sampled_right(int32_t *rx,int32_t *ry);
 
 // Controller state injection point: called after GetNpadState has filled in the original state and before the pseudo-key override. The Mac host touch point script (touch_mac.c, Mac only, kept out of the iOS app by the _mac convention) registers at startup; iOS does not carry that file and it stays empty
 extern void (*dm_pad_hook)(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+
+// Motion sensors (six-axis) of a physical controller: acceleration in G (gravity included; lying flat face up reads about (0, 0, -1)) and angular velocity in revolutions per second,
+// both in nn::hid's controller frame. The host integrates angle and direction and answers GetSixAxisSensorState(s) from it; until the first sample the sensor reads as not connected
+void dm_motion_set(const float acc[3], const float gyro_rps[3]);
+// Vibration: the front end may define these (weak no-ops in hle_hid.c). front_vibrate gets nn::hid::VibrationValue {amplitude low, frequency low, amplitude high, frequency high}
+// for the motor on side 0 (left) or 1 (right); front_vibration_stop silences both
+void front_vibrate(int side, const float v[4]);
+void front_vibration_stop(void);
