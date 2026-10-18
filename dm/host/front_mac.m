@@ -98,8 +98,8 @@ static void pro_home_led_off(void) {
 // revolutions per second (right-handed). DM_PAD_MOTION=<three of x y z, each optionally negated>, e.g. "x,-y,z", remaps both vectors afterwards.
 // A Switch Pro Controller: GameController reports motion for it but every value stays 0 (gravity a fixed (0, 0, -1)), although the controller streams its IMU in every standard input report
 // (0x30, about 67 a second, three samples each: acceleration and gyro as int16, ±8 G = 4096 LSB/G, ±2000 °/s = 16.4 LSB/(°/s)). Those reports are read directly (IOHIDDevice, opened alongside
-// the system driver). Raw axes: x left, y forward, z up, acceleration as the reaction to gravity (+1 G up at rest); so hid = (−x, y, z) for the gyro and (x, −y, −z) for acceleration (as yuzu's
-// Pro Controller driver maps them). The gyro's resting offset (about 1 °/s) is learned while the controller lies still. Other controllers keep GameController's motion (motion_attach)
+// the system driver). Raw axes, measured with the controller flat, standing on its shoulder edge and on its right grip: x forward (towards the shoulder buttons), y left, z up, acceleration
+// as the reaction to gravity (+1 G up at rest); so hid = (−y, x, z) for the gyro and (y, −x, −z) for acceleration (a rotation about z; the earlier (−x, y, z) mirrored and mixed pitch with roll). The gyro's resting offset (about 1 °/s) is learned while the controller lies still. Other controllers keep GameController's motion (motion_attach)
 static int g_mmap[3][2] = {{0, 1}, {1, 1}, {2, 1}};
 static void motion_map_init(void) {
     const char *e = getenv("DM_PAD_MOTION"); if (!e) return;
@@ -133,7 +133,7 @@ static void pro_imu_report(void *ctx, IOReturn r, void *sender, IOHIDReportType 
     if (len < 49 || rep[0] != 0x30) return;
     double ra[3] = {0}, rg[3] = {0};
     for (int f = 0; f < 3; f++) { const uint8_t *v = rep + 13 + 12 * f; for (int i = 0; i < 3; i++) { ra[i] += (int16_t)(v[2 * i] | v[2 * i + 1] << 8) / 3.0; rg[i] += (int16_t)(v[6 + 2 * i] | v[7 + 2 * i] << 8) / 3.0; } }
-    double acc[3] = {ra[0] / 4096, -ra[1] / 4096, -ra[2] / 4096}, dps[3] = {-rg[0] / 16.384, rg[1] / 16.384, rg[2] / 16.384};
+    double acc[3] = {ra[1] / 4096, -ra[0] / 4096, -ra[2] / 4096}, dps[3] = {-rg[1] / 16.384, rg[0] / 16.384, rg[2] / 16.384};
     // resting offset: while the rate stays within 3 °/s of the current offset and the acceleration is about 1 G for a second, the offset follows the average slowly
     double an = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]), dev = 0;
     for (int i = 0; i < 3; i++) dev = fmax(dev, fabs(dps[i] - g_gbias[i]));
