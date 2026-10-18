@@ -1,8 +1,9 @@
 // Switch 原版着色器（Maxwell 机器码）→ SPIR-V（Ryujinx.Graphics.Shader 翻译器），供 B 路线离线出 metallib。
 // 与 Ryujinx.ShaderTools 的区别：翻译器的「查询」按真实情况作答，而不是一律缺省值——
 //   贴图类型 / 图像格式 / 顶点属性类型 / 片元输出类型 / 计算线程组大小取自作业文件（由映射表配对的 PC 反射给出，同槽号 = 同资源）；
-//   窗口原点左上、深度 -1..1（马力欧实测 nvnDeviceSetWindowOriginMode 左上 / SetDepthMode 近=-w，即 GL 口径）：Metal 裁剪要求 0 ≤ z ≤ w，
-//   顶点着色器末尾按 Ryujinx 的办法改写 z' = z/2 + w/2（DepthMode + 宿主不支持深度裁剪控制）；不改的话 z = -w 的全屏拷贝整个被裁掉，窗口全黑。
+//   窗口原点左上；深度不改写（z 原样出，即 NVN 近=0 口径）。游戏的深度口径是运行时状态（nvnDeviceSetDepthMode：马力欧 / 银河战士等用缺省的近=-w 即 GL 口径，
+//   织梦岛 / 十三机兵 / Engage 设近=0），所以 GL 口径的 z' = z/2 + w/2 由 dmsh_build.py 在 MSL 里补出两个入口：main0（改写，GL）与 main0_z（不改写，近=0），宿主按游戏设的口径挑。
+//   以前这里固定按 GL 改写：近=0 的游戏深度全被压进 0.5..1，按深度算距离的效果（织梦岛户外景深整屏糊、遮蔽）全错。
 // 用法：dmsh_xlate <作业.json> <输出目录>
 //   作业：[{ "key", "stage": "vs|ps|cs", "code": 机器码文件（图形 = 0x50 字节 SPH + 指令，计算 = 指令），
 //            "tex": { "槽": "2d|2darray|cube|cubearray|3d|buffer|1d|1darray|2dms|2dmsarray", … }, "img": { "槽": { "type", "fmt" } },
@@ -11,8 +12,9 @@
 // Original Switch shaders (Maxwell machine code) → SPIR-V (the Ryujinx.Graphics.Shader translator), for route B's offline metallib build.
 // Difference from Ryujinx.ShaderTools: the translator's "queries" are answered truthfully rather than always with defaults -
 //   texture type / image format / vertex attribute type / fragment output type / compute thread group size come from the job file (given by the PC reflection paired via the mapping table; same slot number = same resource);
-//   window origin upper-left, depth -1..1 (measured on Mario: nvnDeviceSetWindowOriginMode upper-left / SetDepthMode near=-w, i.e. the GL convention): Metal clipping requires 0 ≤ z ≤ w,
-//   so vertex shaders rewrite z' = z/2 + w/2 at the end, Ryujinx's way (DepthMode + host without depth clip control); without it the full-screen copy at z = -w is clipped away entirely and the window is black.
+//   window origin upper-left; depth is not rewritten (z goes out unchanged, NVN's near=0 convention). A game's depth convention is runtime state (nvnDeviceSetDepthMode: Mario / Metroid etc. keep the default near=-w, the GL convention;
+//   Link's Awakening / 13 Sentinels / Engage set near=0), so dmsh_build.py adds the GL rewrite z' = z/2 + w/2 in the MSL as two entry points, main0 (rewritten, GL) and main0_z (unchanged, near=0), and the host picks by the game's convention.
+//   This used to rewrite for GL always: a near=0 game's depth was squeezed into 0.5..1, and effects that turn depth into distance (Link's Awakening's outdoor depth of field blurring the whole screen, occlusion) were all wrong.
 // Usage: dmsh_xlate <job.json> <output dir>
 //   Job: [{ "key", "stage": "vs|ps|cs", "code": machine code file (graphics = 0x50-byte SPH + instructions, compute = instructions),
 //           "tex": { "slot": "2d|2darray|cube|cubearray|3d|buffer|1d|1darray|2dms|2dmsarray", ... }, "img": { "slot": { "type", "fmt" } },
@@ -91,11 +93,11 @@ static class SwshXlate
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
             return new GpuGraphicsState(false, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
-                false, false, false, true /* 深度 -1..1（GL）| depth -1..1 (GL) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
+                false, false, false, false /* 深度不改写：GL 口径的入口由 dmsh_build.py 补（见文件头）| depth not rewritten: dmsh_build.py adds the GL entry point (see the file header) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsTextureShadowLod() => true;
-        public bool QueryHostSupportsDepthClipControl() => false;   // Metal 没有 -1..1 裁剪控制：让翻译器在顶点着色器里改写 z（见文件头） | Metal has no -1..1 clip control: have the translator rewrite z in the vertex shader (see the file header)
+        public bool QueryHostSupportsDepthClipControl() => false;   // Metal 没有 -1..1 裁剪控制；深度口径不交给翻译器，改写在 MSL 里按入口补（见文件头） | Metal has no -1..1 clip control; the depth convention is not left to the translator, the rewrite is added per entry point in the MSL (see the file header)
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;

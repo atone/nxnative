@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# The game name from the NSP's control data (control.nacp, saved in the extraction folder by nx_extract): the iOS app name comes from it (shared by the packing script and build_ipa.sh).
-# Usage: nacp.py <control.nacp> (prints the game name; prints an empty line and exits 1 when none can be read); from Python: import nacp; nacp.name(path)
-import struct, sys, zlib
+# The game name and display version from the NSP's control data (control.nacp, saved in the extraction folder by nx_extract): the iOS app name and version come from them (shared by the packing script and build_ipa.sh).
+# Usage: nacp.py <control.nacp> (prints the game name), nacp.py --version <control.nacp> (prints the display version); each prints an empty line and exits 1 when none can be read. From Python: import nacp; nacp.name(path), nacp.version(path)
+import re, struct, sys, zlib
 from pathlib import Path
 
 
@@ -23,6 +23,16 @@ def name(path):
     return ''
 
 
+def version(path):
+    """The display version (0x10 bytes at 0x3060, e.g. 1.2.1), cut to what iOS accepts as a bundle version (up to three dot-separated integers); a missing file or no leading number returns an empty string"""
+    p = Path(path)
+    if not p.is_file(): return ''
+    m = re.match(rb'\d+(\.\d+){0,2}', p.read_bytes()[0x3060:0x3070])
+    return m.group().decode() if m else ''
+
+
 if __name__ == '__main__':
-    if len(sys.argv) != 2: sys.exit('用法 | usage: nacp.py <control.nacp>')
-    n = name(sys.argv[1]); print(n); sys.exit(0 if n else 1)
+    a = sys.argv[1:]; f = version if a[:1] == ['--version'] else name
+    if f is version: a = a[1:]
+    if len(a) != 1: sys.exit('用法 | usage: nacp.py [--version] <control.nacp>')
+    n = f(a[0]); print(n); sys.exit(0 if n else 1)

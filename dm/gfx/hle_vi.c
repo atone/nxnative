@@ -19,6 +19,10 @@ HLE_FORCE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", "原生窗口句柄，�
 HLE_FORCE("_ZN2nn2vi12SetLayerCropEPNS0_5LayerEiiii", "图层裁切；宿主出图不裁", Result, h_vi_SetCrop, void *layer, int x, int y, int w, int h) {
     (void)layer; LOG("vi::SetLayerCrop %d,%d %dx%d（忽略）", x, y, w, h); return RES_OK;
 }
+// Super Mario Odyssey sets its layer's scaling mode; the SDK's version uses the vi service objects the host never made
+HLE_FORCE("_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE", "图层缩放方式；宿主出图自己缩放", Result, h_vi_SetScaling, void *layer, int mode) {
+    (void)layer; LOG("vi::SetLayerScalingMode %d（忽略）", mode); return RES_OK;
+}
 HLE_FORCE("_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", "销毁图层；宿主静态对象", void, h_vi_DestroyLayer, void *layer) { (void)layer; }
 HLE_FORCE("_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE", "关显示；宿主静态对象", void, h_vi_CloseDisp, void *disp) { (void)disp; }
 HLE_FORCE("_ZN2nn2vi8FinalizeEv", "显示服务收尾；宿主无 vi 服务", void, h_vi_Fini, void) {}

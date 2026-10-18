@@ -115,3 +115,9 @@ HLE_FORCE("nnsocketShutdown", "离线（剪）", int, h_c_sk_Shutdown, void) { r
 HLE_FORCE("nnsocketGetAddrInfo", "域名解析（剪）：EAI_FAIL", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
 HLE_FORCE("nnsocketFreeAddrInfo", "与 GetAddrInfo 配对（剪）", void, h_c_sk_FreeAi, void *ai) { (void)ai; }
 HLE_FORCE("nnsocketGAIStrError", "解析错误文字", const char *, h_c_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+
+// ---------- bcat: news / data delivered from the server (Super Mario Odyssey). Initialize talks to the bcat service (an SDK abort without it); mounting the delivery cache fails,
+// which the game treats as "nothing delivered" (main+0x6c9258: a failure skips the read unless the caller asked for an error dialog, which only logs here). Syncing needs the network, which nifm reports unavailable ----------
+HLE_FORCE("_ZN2nn4bcat10InitializeEv", "数据投递初始化（连 bcat 服务）；宿主没有，空操作", void, h_bcat_Init, void) {}
+HLE_FORCE("_ZN2nn4bcat25MountDeliveryCacheStorageEv", "挂载投递缓存：没有投递数据，失败", Result, h_bcat_Mount, void) { return RES_FAIL; }
+HLE_FORCE("_ZN2nn4bcat27UnmountDeliveryCacheStorageEv", "卸载投递缓存", void, h_bcat_Unmount, void) {}

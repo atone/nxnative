@@ -158,6 +158,17 @@ CUTS = {
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager 构造：节点区上限 mov w8,#0x3fe00000 → mov w8,#0x3e00000', '仅宿主'),
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager 构造：节点区登记为已占区域的长度 mov w9,#0x3fe00000 → mov w9,#0x3e00000', '仅宿主'),
   ],
+  # The Legend of Zelda: Link's Awakening 1.1.0 (v131072) main: the physics step (main+0x15730, main thread) rebuilds each world's PhysX completion task in place
+  # (a PxLightCpuTask at world+0xc8) and passes it to simulate. A worker runs it (main+0x10ccf80: fetchResults, world+0x1d8 done = 1, notify, unlock) and then calls its
+  # release (main+0x10cd070), which calls the task's own destructor: vtable back to the PxLightCpuTask base, mTm = 0 (main+0x10cced0). At 30 fps the game steps twice
+  # per frame (step, wait, step, wait); the unlock hands the world's mutex to the woken main thread, and when the worker is descheduled there the main thread's
+  # next step rebuilds the task before the late destructor runs, which then wipes the new task. The next simulation's NpSceneCompletion::release reads its mTm = 0:
+  # crash at main+0x10ccf28 (lr main+0x13c236c; seen on the iPhone and in 2 of 5 Mac runs, in every Mac run under CPU load). On the Switch the release follows the
+  # unlock within nanoseconds. The release becomes a plain ret: the destructor only resets the vtable and mTm (no resources), the step rebuilds every field, and this
+  # release is used by this one vtable (main+0x1c51308 slot 7) only
+  '909e904af78ac1b8deefe97ab2ccdb51': [
+    (0x10cd070, '080040f9', 'c0035fd6', '物理完成任务 release（自调析构）：ldr x8,[x0] → ret（不再析构；步进函数每步原地重建）', '仅宿主'),
+  ],
 }
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
@@ -580,15 +591,17 @@ def jump_offsets(insl, j):
     """The br x18 is preceded by the offset-table form (Engage main+0x12eec94): cmp w18,#N; b.hi; ldrsw x18,[xB,x18,lsl #2]; add x18,x18,xB.
     The index may be another register, and the bounds check may be on a register copied into it: Link's Awakening's GLSLC (subsdk0+0x1be6e8) has
     sub w0,w18,#0xd1; cmp w0,#0x31; b.hi; ldrsw x18,[x17,x0,lsl #2], its movie module (subsdk1+0xae9a4) cmp w21,#7; b.hi; ...; mov w18,w21; ldrsw x18,[x4,x18,lsl #2].
+    The entry may also be loaded into another register and only the add writes x18: Cuphead (Unity 2017.4, main+0x1bb872c) has cmp w17,#7; ldrsw x17,[x15,x17,lsl #2]; add x18,x17,x15
+    (found by armyja, GitHub pull request #1).
     For the table base xB, search back for the nearest writer: it must be add xB,xB,#lo, and the writer before it must be adrp xB. Returns all targets, or None if not recognized"""
     ctx = insl[max(0, j - 16):j]
-    add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x18, x\d+', p.op_str)), None)
+    add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
     if not add: return None
-    rb = add.op_str.split(', ')[2]
-    ld = next((p for p in reversed(ctx) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'x18, \[{rb}, x(\d+), lsl #2\]', p.op_str)), None)
+    _, t, rb = add.op_str.split(', ')   # t = the loaded entry, rb = the table base
+    ld = next((p for p in reversed(ctx) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', p.op_str)), None)
     if not ld: return None
     # GLSLC subsdk0+0x2f403c checks a masked copy instead: and w16,w18,#0x3f; cmp w16,#0xe; b.hi; ...; and x18,x18,#0x3f; ldrsw x18,[x15,x18,lsl #2]
-    idx = {'w' + re.fullmatch(rf'x18, \[{rb}, x(\d+), lsl #2\]', ld.op_str).group(1)}
+    idx = {'w' + re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', ld.op_str).group(1)}
     masked = None   # (source, mask, position) when the index is "source & mask"
     k0 = ctx.index(ld); cmp = None
     def wname(r): return 'w' + r[1:]
@@ -632,7 +645,8 @@ for fa, fb in funcs:
     for j, ins in enumerate(insl):
         if ins.mnemonic == 'br' and ins.op_str == 'x18':
             base = width = None
-            ctx = insl[max(0, j - 8):j]
+            # 16 instructions back, as for the offset-table form: Hades main+0x1135d0 has six vector moves between the add and the br, which put its adr x18 nine back
+            ctx = insl[max(0, j - 16):j]
             for p in reversed(ctx):
                 if p.mnemonic == 'adr' and p.op_str.startswith('x18,'): base = p.operands[1].imm; break
             for p in reversed(ctx):

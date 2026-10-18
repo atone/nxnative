@@ -54,8 +54,8 @@ targets:
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
       PRODUCT_NAME: DmIOS
-      MARKETING_VERSION: "1.0"
-      CURRENT_PROJECT_VERSION: "1"
+      MARKETING_VERSION: ${DM_APP_VERSION}         # the game's display version: the packed update's, else the base game's (set by build_ipa.sh)
+      CURRENT_PROJECT_VERSION: ${DM_APP_VERSION}
       DEVELOPMENT_TEAM: ${DM_TEAM_ID}
       CODE_SIGN_STYLE: Automatic
       ASSETCATALOG_COMPILER_APPICON_NAME: $(DM_APPICON)   # Gen/dm.xcconfig sets DM_APPICON = AppIcon when there is a game icon; empty = no icon (xcodegen's default is AppIcon, which fails the build when the catalog lacks it)

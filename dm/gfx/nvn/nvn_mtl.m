@@ -17,7 +17,6 @@
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
-#include "../tex/nvn_bcdec.h"
 #include "nvn_builtin.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
@@ -884,19 +883,9 @@ static uint64_t g_pfv_upgrades;
 // DM_NVN_DIRTYCHECK=1 (diagnostic, compared against ground truth): fully hash the pool content on every use; changed but not detected by dirty-page tracking = a missed detection
 static int dirtycheck(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_DIRTYCHECK") != NULL; return v; }
 static uint64_t full_hash(const uint8_t *m, uint64_t n) { uint64_t h = 1469598103934665603ull; for (uint64_t i = 0; i < n; i++) h = (h ^ m[i]) * 1099511628211ull; return h; }
-// The GPU does not support BC compressed formats (A15 / A16 etc.): BC textures are created in the decompressed format and decompressed on the CPU at upload / buffer→texture copy time (nvn_bcdec.c).
-// BC3 among the game textures was converted to ASTC offline by the Legacy Device Pack (dm/tools/astc_pack.py); what reaches here is the small remainder of BC. The test switch DM_TEST_NO_BC=1 forces this path on any machine
-static int no_bc(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_TEST_NO_BC"); v = (e && *e && strcmp(e, "0")) || ![g_dev supportsBCTextureCompression];
-        if (v) MLOG("显卡不支持 BC 压缩格式%s：BC 贴图建成解压格式（BC1–5 在 GPU 上解压，BC6H / BC7 / 3D 在 CPU 上）", e && *e && strcmp(e, "0") ? "（测试开关 DM_TEST_NO_BC）" : ""); }
-    return v;
-}
-static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp) { return no_bc() && nvn_bc_unpacked(nvn_fmt, pf, bpp); }
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "贴图格式 %#x Metal 无对应（首例）", t->d.format); return nil; }
-    int unp = 0; { uint32_t upf; int ubpp; if (bc_unpack(t->d.format, &upf, &ubpp)) { pf = upf; unp = 1; } }
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048 || t->d.levels > 15) { RED_ONCE(71, "贴图尺寸超出 Metal 上限：%u×%u×%u 级 %u 格式 %#x 目标 %d（首例 ser=%llu）", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -921,8 +910,7 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     }
     d.storageMode = MTLStorageModePrivate;   // Render targets and assets both go in GPU private storage (lossless compression available)
     d.usage = MTLTextureUsageShaderRead | (fmt_compressed(t->d.format) || packaged ? 0 : MTLTextureUsageRenderTarget)
-            | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0)   // Image usage: shader-writable (compute kernels generating the 3D color lookup table, etc.)
-            | (unp ? MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView : 0);   // No BC: textures in the decompressed format are written by the GPU decompression kernel (up_dec) / receive whole-block copies from ASTC sources (copy_t2t_astc)
+            | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0);   // Image usage: shader-writable (compute kernels generating the 3D color lookup table, etc.
     return d;
 }
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
@@ -973,45 +961,6 @@ typedef struct {
     NSUInteger slice, level;
 } up_blit;
 static up_blit *g_up_blits; static int g_nup_blits, g_up_blitcap;
-// Without BC, BC1–5 are decompressed on the GPU (A16 logs: CPU deswizzle + CPU decompression took over 300 ms in a single frame): the GPU deswizzle writes the compressed blocks into the staging area, and at flush time, after the barrier,
-// the compute kernel bcd decodes them into the texture one thread per block (the target is a 2D view in the decompressed format; an sRGB base texture is written with raw values through an RGBA8Unorm view). BC6H / BC7 / 3D textures are very few and still go through the CPU (nvn_bcdec.c)
-typedef struct { __unsafe_unretained id<MTLBuffer> src, params; size_t off, poff; uint32_t bw, bh; __unsafe_unretained id<MTLTexture> view; } up_dec;   // view: held by g_up_texs within the batch, and afterwards by defer_obj_unref until the GPU finishes
-static up_dec *g_up_decs; static int g_nup_decs, g_up_deccap;
-static const char k_bcd_msl[] =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"struct P { uint off, pitch, w, h, fmt; };\n"   // fmt: 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC4 signed, 6 BC5, 7 BC5 signed
-"static float3 c565(uint c) { return float3((c >> 11) & 31, (c >> 5) & 63, c & 31) / float3(31, 63, 31); }\n"
-"static void col(device const uchar *b, thread float4 *o, bool four) {\n"
-"  uint c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8), ix = b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24); float3 e0 = c565(c0), e1 = c565(c1); float4 p[4];\n"
-"  p[0] = float4(e0, 1); p[1] = float4(e1, 1);\n"
-"  if (four || c0 > c1) { p[2] = float4((2 * e0 + e1) / 3, 1); p[3] = float4((e0 + 2 * e1) / 3, 1); } else { p[2] = float4((e0 + e1) / 2, 1); p[3] = float4(0); }\n"
-"  for (int i = 0; i < 16; i++) o[i] = p[(ix >> (2 * i)) & 3]; }\n"
-"static void a8(device const uchar *b, thread float *o, bool sn) {\n"   // Single-channel block of BC4 / BC3 alpha / BC5
-"  float a0 = sn ? max(float(as_type<char>(b[0])), -127.0) / 127 : b[0] / 255.0, a1 = sn ? max(float(as_type<char>(b[1])), -127.0) / 127 : b[1] / 255.0;\n"
-"  bool eight = sn ? as_type<char>(b[0]) > as_type<char>(b[1]) : b[0] > b[1]; float lo = sn ? -1 : 0; float p[8]; p[0] = a0; p[1] = a1;\n"
-"  for (int k = 2; k < 8; k++) p[k] = eight ? ((8 - k) * a0 + (k - 1) * a1) / 7 : (k < 6 ? ((6 - k) * a0 + (k - 1) * a1) / 5 : (k == 6 ? lo : 1));\n"
-"  uint lo24 = b[2] | (b[3] << 8) | (b[4] << 16), hi24 = b[5] | (b[6] << 8) | (b[7] << 16);\n"
-"  for (int i = 0; i < 16; i++) o[i] = p[i < 8 ? (lo24 >> (3 * i)) & 7 : (hi24 >> (3 * (i - 8))) & 7]; }\n"
-"kernel void bcd(device const uchar *src [[buffer(0)]], device const P &p [[buffer(1)]], texture2d<float, access::write> dst [[texture(0)]], uint2 g [[thread_position_in_grid]]) {\n"
-"  uint nbx = (p.w + 3) / 4, nby = (p.h + 3) / 4; if (g.x >= nbx || g.y >= nby) return;\n"
-"  uint bb = (p.fmt == 1 || p.fmt == 4 || p.fmt == 5) ? 8 : 16; device const uchar *b = src + p.off + g.y * p.pitch + g.x * bb; float4 o[16]; float a[16], c[16];\n"
-"  if (p.fmt == 1) col(b, o, false);\n"
-"  else if (p.fmt == 2) { col(b + 8, o, true); for (int i = 0; i < 16; i++) o[i].a = ((b[i / 2] >> (4 * (i & 1))) & 15) / 15.0; }\n"
-"  else if (p.fmt == 3) { col(b + 8, o, true); a8(b, a, false); for (int i = 0; i < 16; i++) o[i].a = a[i]; }\n"
-"  else if (p.fmt == 4 || p.fmt == 5) { a8(b, a, p.fmt == 5); for (int i = 0; i < 16; i++) o[i] = float4(a[i], 0, 0, 1); }\n"
-"  else { a8(b, a, p.fmt == 7); a8(b + 8, c, p.fmt == 7); for (int i = 0; i < 16; i++) o[i] = float4(a[i], c[i], 0, 1); }\n"
-"  for (int i = 0; i < 16; i++) { uint2 q = g * 4 + uint2(i & 3, i >> 2); if (q.x < p.w && q.y < p.h) dst.write(o[i], q); } }\n";
-static int bcd_fmt(uint32_t f) {   // NVN format → bcd fmt; 0 = not decoded on the GPU (BC6H / BC7 / non-BC)
-    switch (f) { case 0x41: case 0x42: case 0x45: case 0x46: return 1; case 0x43: case 0x47: return 2; case 0x44: case 0x48: return 3;
-                 case 0x49: return 4; case 0x4a: return 5; case 0x4b: return 6; case 0x4c: return 7; default: return 0; }
-}
-static id<MTLComputePipelineState> bcd_pso(void) {
-    static id<MTLComputePipelineState> ps; static int failed;
-    if (!ps && !failed) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_bcd_msl) options:nil error:&e]; id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"bcd"] : nil;
-        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!ps) { failed = 1; MLOG("【红】无 BC：GPU 解压管线建不出 %s（退回 CPU 解压）", e.localizedDescription.UTF8String); } else MLOG("无 BC：BC1–5 改在 GPU 上解压"); }
-    return ps;
-}
 static NSMutableArray *g_up_texs;   // Target textures in the batch: before the flush, textures may be replaced / released within the same submission
 static id<MTLBuffer> g_up_block;
 static size_t g_up_block_off, g_up_block_size;
@@ -1032,17 +981,11 @@ static void up_flush(void) {
     if (g_up_ce) {
         m4_end(g_up_ce); g_up_ce = nil;
     }
-    id<MTL4ComputeCommandEncoder> b = g_nup_blits || g_nup_decs ? g_up_ce = [g_up_cb computeCommandEncoder] : nil;
+    id<MTL4ComputeCommandEncoder> b = g_nup_blits ? g_up_ce = [g_up_cb computeCommandEncoder] : nil;
     if (b) [b barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     for (int i = 0; b && i < g_nup_blits; i++) {
         up_blit *x = &g_up_blits[i];
         enc_b_copy_buffer_texture(b, x->src, x->off, x->row, x->image, x->size, x->dst, x->slice, x->level, MTLOriginMake(0, 0, 0));
-    }
-    if (b && g_nup_decs) {   // GPU decompression without BC (see up_dec): offsets in the parameter block are relative to the start of the staging block
-        [b setArgumentTable:g_up_ct]; [b setComputePipelineState:bcd_pso()];
-        for (int i = 0; i < g_nup_decs; i++) { up_dec *x = &g_up_decs[i];
-            [g_up_ct setAddress:x->src.gpuAddress atIndex:0]; [g_up_ct setAddress:x->params.gpuAddress + x->poff atIndex:1]; [g_up_ct setTexture:x->view.gpuResourceID atIndex:0];
-            [b dispatchThreadgroups:MTLSizeMake((x->bw + 7) / 8, (x->bh + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; }
     }
     if (b) { m4_end(b); g_up_ce = nil; }
     id<MTL4CommandBuffer> cb = g_up_cb;
@@ -1071,7 +1014,7 @@ static void up_flush(void) {
     for (id obj in g_up_keep) defer_obj_release(obj);
     [g_up_keep removeAllObjects];
     up_diag();
-    g_nup_blits = 0; g_nup_decs = 0;
+    g_nup_blits = 0;
     [g_up_texs removeAllObjects];
 }
 
@@ -1170,40 +1113,27 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
     if (t->d.target == 9) layers *= 6;
-    uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // No BC: decompress on the CPU after deswizzling, with the staging area sized for the decompressed data
     size_t total = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
-        total += unp ? (size_t)w * ubpp * h * z * layers : (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
+        total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int gdec = unp && t->d.target != 2 && bcd_fmt(t->d.format) && bcd_pso();   // BC1–5 without BC: GPU deswizzle + GPU decompression
-    size_t ctotal = 0;   // Staging size of the compressed blocks (with GPU decompression the staging area holds compressed blocks)
-    if (gdec) for (unsigned l = 0; l < d.mipmapLevelCount; l++) { uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u); ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * layers; }
-    int use_gpu = (!unp || gdec) && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
-    if (g_nvn_deswz_gpu && !use_gpu && !unp) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
+    int use_gpu = g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
+    if (g_nvn_deswz_gpu && !use_gpu) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
         size_t stg_off;
-        id<MTLBuffer> stg = up_alloc(gdec ? ctotal : total ? total : 16, &stg_off);
-        size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits, nd0 = g_nup_decs;
+        id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
+        size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
             for (unsigned y = 0; y < layers; y++) {
                 size_t poff; id<MTLBuffer> params = up_param_alloc(&poff);   // Metal 4 has no setBytes: the parameter block of each deswizzle is cut from a shared block (no new GPU buffer each time)
                 if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
-                if (gdec) {   // Decompression job: dispatched at flush time after the barrier (see up_flush)
-                    MTLPixelFormat vf = mt.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : mt.pixelFormat;
-                    id<MTLTexture> v = [mt newTextureViewWithPixelFormat:vf textureType:MTLTextureType2D levels:NSMakeRange(l, 1) slices:NSMakeRange(y, 1)];
-                    size_t qoff; id<MTLBuffer> q = up_param_alloc(&qoff);
-                    if (!v || !q) { enc_ok = 0; break; }
-                    uint32_t *pp = (uint32_t *)((uint8_t *)q.contents + qoff); pp[0] = (uint32_t)(stg_off + off); pp[1] = (uint32_t)pitch; pp[2] = w; pp[3] = h; pp[4] = (uint32_t)bcd_fmt(t->d.format);
-                    if (g_nup_decs == g_up_deccap) { g_up_deccap = g_up_deccap ? g_up_deccap * 2 : 256; g_up_decs = realloc(g_up_decs, g_up_deccap * sizeof *g_up_decs); }
-                    g_up_decs[g_nup_decs++] = (up_dec){stg, q, 0, qoff, (w + 3) / 4, (h + 3) / 4, v}; [g_up_texs addObject:v]; defer_obj_unref(v);   // View: released after this submission finishes running, residency not revoked (what is resident is the base texture)
-                } else
                 up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
                 off += pitch * rows * z;
             }
@@ -1213,7 +1143,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
             if (!g_cb) up_flush();
             return mt;
         }
-        g_nup_blits = nb0; g_nup_decs = nd0;   // Roll back the copies / decompressions already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
+        g_nup_blits = nb0;   // Roll back the copies already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
         if (!g_cb) up_flush();
         RED_ONCE(41, "预排布贴图 GPU 解排布不支持格式 %#x 目标 %d，回退 CPU", t->d.format, t->d.target);
     }
@@ -1226,15 +1156,6 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
-            if (unp) {   // No BC: first deswizzle into a temporary area (compressed blocks), then decompress layer by layer into the staging area
-                uint8_t *cb = malloc(pitch * rows * z); size_t up = (size_t)w * ubpp;
-                if (!cb || nvn_deswizzle(&t->d, l, y, t->mem, cb, pitch)) { free(cb); RED_ONCE(9, "解排布失败 格式 %#x 目标 %d", t->d.format, t->d.target); break; }
-                for (uint32_t zi = 0; zi < z; zi++) nvn_bc_decode(t->d.format, cb + zi * pitch * rows, pitch, w, h, (uint8_t *)stg.contents + off + zi * up * h, up);
-                free(cb);
-                up_blit_add(stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l);
-                off += up * h * z;
-                continue;
-            }
             if (nvn_deswizzle(&t->d, l, y, t->mem, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "解排布失败 格式 %#x 目标 %d", t->d.format, t->d.target); break; }
             up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
             off += pitch * rows * z;
@@ -1830,6 +1751,7 @@ void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
 //   Metal can neither attach a compressed format as a colour attachment nor create compressed <-> uncompressed views (the pipeline descriptor validation aborts the process). For now the attachment is left out (a pass with no attachment at all skips its draws), with a red line;
 //   drawing it correctly needs an uncompressed proxy texture with the same block size, copied into the compressed texture through a buffer after the pass
 static int mtl_fmt_block(MTLPixelFormat f) { return (f >= MTLPixelFormatBC1_RGBA && f <= MTLPixelFormatBC7_RGBAUnorm_sRGB) || (f >= MTLPixelFormatPVRTC_RGB_2BPP && f < MTLPixelFormatGBGR422); }
+static int nvn_fmt_bc(uint32_t f) { return f >= 0x41 && f <= 0x50; }   // NVN BC1–7 / BC6H formats (0x41 RGB_DXT1 … 0x50 BC6H unsigned)
 static MTLPixelFormat rt_view_fmt(id<MTLTexture> base, const view_t *v, int has_v) {
     if (base && mtl_fmt_block(base.pixelFormat)) {
         RED_ONCE(78, "渲染目标是压缩格式贴图（Metal 格式 %lu %lux%lu 层 %lu，视图换格式 %d → NVN %#x）：不挂，该附件的绘制落空", (unsigned long)base.pixelFormat, (unsigned long)base.width, (unsigned long)base.height,
@@ -2235,6 +2157,15 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     dispatch_data_t d = dispatch_data_create(m, len, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(m, len); });
     return [g_dev newLibraryWithData:d error:err];
 }
+// NVN depth mode (nvnDeviceSetDepthMode): every vertex library has two entry points (dmsh_build.py vs_depth): main0 rewrites z for the GL convention (near = -w, NVN's default),
+// main0_z leaves z as is (near = 0, which Link's Awakening, 13 Sentinels and Engage set). Loading picks by the mode the game set, so no game needs a setting for it
+static _Atomic int g_depth_zero, g_vs_loaded;
+void mtl_set_depth_zero(int on) {
+    if (atomic_exchange(&g_depth_zero, on) == on) return;
+    MLOG("深度模式：%s", on ? "近=0，顶点着色器用 main0_z 入口" : "近=-w（GL），顶点着色器用 main0 入口");
+    int n = atomic_load(&g_vs_loaded);
+    if (n) MLOG("【红】深度模式在载入 %d 个顶点着色器之后才改：它们仍按原口径", n);
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc];
@@ -2247,7 +2178,12 @@ static NvShader *shader_load(NSString *pc, int stage) {
     char err[160];
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
-    o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
+    NSString *entry = j[@"entry"];
+    if (stage == 0) {
+        atomic_fetch_add(&g_vs_loaded, 1);
+        if (atomic_load(&g_depth_zero)) { if (j[@"entry_z"]) entry = j[@"entry_z"]; else RED_ONCE(85, "顶点着色器 %s 没有近=0 入口（entry_z）：深度按 GL 口径改写", pc.UTF8String); }
+    }
+    o->fn = [lib newFunctionWithName:entry]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     { NSDictionary *fv = j[@"float_variant"]; if ([fv isKindOfClass:[NSDictionary class]] && [fv[@"key"] isKindOfClass:[NSString class]]) { o->fv_key = fv[@"key"]; for (NSNumber *l in fv[@"locations"]) if (l.intValue < 32) o->fv_locs |= 1u << l.intValue; } }
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
@@ -2423,12 +2359,6 @@ static int g_tpool_n; static uint64_t g_stat_tex_oob;
 // convention itself (text rendered into textures for the title and the menus came out upside down, and a MIRROR_Y copy of the frame)
 static _Atomic int g_origin_ll;
 void mtl_set_origin_lower_left(int on) { if (atomic_exchange(&g_origin_ll, on) != on) MLOG("窗口原点：%s", on ? "左下（GL，视口倒向、绕向反、出图翻转）" : "左上"); }
-// NVN depth mode. The translator ends every vertex shader with z' = z/2 + w/2 (dmsh_xlate: Metal clips at z < 0, and the GL mode puts the near plane at z = -w), which is right for near = -w.
-// A game in near = 0 mode (Link's Awakening) already outputs z in [0, w], so its window depth came out as (d + 1) / 2: depth tests kept their order, but everything that turns depth back into
-// distance read the scene as farther (depth of field focused at 26.5 found the ground at ~40 and blurred the whole picture). The viewport depth range [2n - f, f] maps z' back to the game's depth.
-// Geometry in front of the near plane is no longer clipped in this mode (it would need the vertex shaders); it gets a window depth below n
-static _Atomic int g_depth_zero;
-void mtl_set_depth_near_zero(int on) { if (atomic_exchange(&g_depth_zero, on) != on) MLOG("深度模式：%s", on ? "近=0（视口深度范围改为 [2n-f, f]，抵消翻译器的 z/2+w/2）" : "近=-w（GL）"); }
 void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
 static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
     if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（池容量 %d）按空槽处理：读出 0", tid, g_tpool_n); return nil; }
@@ -2455,7 +2385,10 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         if (!r.has_v) memset(&r.v, 0, sizeof r.v);
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
-        { uint32_t upf; int ubpp; if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // No BC: a BC view is switched to the decompressed format just like the base texture
+        if (r.v.set_format && nvn_fmt_bc(rp->t.d.format) && !nvn_fmt_bc(r.v.format)) {   // the raw blocks of a BC texture through an uncompressed view (see rt_view_fmt): Metal has no such view
+            RED_ONCE(86, "压缩格式贴图的原始块视图（NVN 格式 %#x → 视图 %#x）Metal 建不出：按空槽", rp->t.d.format, r.v.format);
+            return nil;
+        }
         if (r.v.set_format && tex_need_pfv(base.pixelFormat, (MTLPixelFormat)pf) && !(base.usage & MTLTextureUsagePixelFormatView)) {
             base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf);
             sg = g_ser_gen;
@@ -2565,7 +2498,7 @@ static id<MTLTexture> tex_alpha_one(int tid, id<MTLTexture> t, uint64_t *rid) {
     NSUInteger ns = t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
     id<MTLTexture> v = [base newTextureViewWithPixelFormat:t.pixelFormat textureType:t.textureType levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns)
                                                    swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleOne)];
-    if (!v) { RED_ONCE(85, "alpha 取 1 的视图建不出（贴图号 %d 格式 %lu）", tid, (unsigned long)t.pixelFormat); return nil; }
+    if (!v) { RED_ONCE(87, "alpha 取 1 的视图建不出（贴图号 %d 格式 %lu）", tid, (unsigned long)t.pixelFormat); return nil; }
     { static int nlog; if (nlog++ < 4) MLOG("四通道贴图 alpha 取 1：贴图号 %d %lux%lu 格式 %lu", tid, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat); }
     r->ar = (void *)CFBridgingRetain(v); r->ar_of = (__bridge void *)t; r->ar_rid = v.gpuResourceID._impl;
     *rid = r->ar_rid; return v;
@@ -2636,7 +2569,6 @@ static struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp;
     float blend_color[4]; int64_t copy_stride, copy_img_stride;
 } S;
-static uint32_t g_dispatch_grid[3];   // grid of the compute dispatch being encoded (driver segment c0 of compute shaders, encode_args)
 static void udc_note_draw(NvProg *pr) {
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
     if (pr) for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue; for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_IMG) { zskip_clear(); break; } }   // Image slots are writable: conservatively clear
@@ -2773,8 +2705,9 @@ static NvShader *vs_mixed(NvShader *fv, NSString *name, uint32_t imask) {
         NSRegularExpression *use = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\bin\\.%@\\b", name] options:0 error:nil];
         [use replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:[NSString stringWithFormat:@"as_type<float4>(in.%@)", name]];
     }
-    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:m options:nil error:&e];
-    id<MTLFunction> fn = [lib newFunctionWithName:fv->fn.name];
+    MTLCompileOptions *co = [MTLCompileOptions new]; co.preserveInvariance = YES;   // as every packaged library (-fpreserve-invariance): depth pre-pass and main pass agree on positions
+    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:m options:co error:&e];
+    id<MTLFunction> fn = [lib newFunctionWithName:fv->fn.name];   // main0 or main0_z, as the variant was loaded (see shader_load)
     if (!fn) { MLOG("【红】顶点着色器 %s 的混合输入版本编不出：%s", fv->key, e.localizedDescription.UTF8String); return nil; }
     NvShader *o = [NvShader new]; o->fn = fn; o->rf = fv->rf; o->stage = fv->stage; strlcpy(o->key, fv->key, sizeof o->key);
     for (int v = 0; v < o->rf.nv; v++) if (imask >> o->rf.v[v].loc & 1) o->rf.v[v].ct = NVN_CT_UINT;
@@ -3159,6 +3092,7 @@ static uint32_t ubo_handle(int stage, int reg, int off) {
     if (!mtl_addr(u->addr + off, 4, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 0;
     uint32_t h; memcpy(&h, base + mo, 4); return h;
 }
+static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute)
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
@@ -3256,16 +3190,20 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
             // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
             int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
-            // Compute shaders always get a filled c0: the packaging scan (dmsh_build.py drv_reads) only sees fragment-stage reads, so a kernel's drv_read is never set.
-            // Link's Awakening's tile light culling reads its grid width at c0+0x200; given zeros, it never filled its 64x64-pixel light table (white tiles flickering on lit surfaces)
-            if (!sh->rf.drv_read[bank] && !(bank == 0 && nvn_stage == 5)) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+            if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
             else {
                 id<MTLBuffer> db; size_t doff = arena_alloc(0xA00, &db); uint8_t *d = (uint8_t *)db.contents + doff; memset(d, 0, 0xA00);
                 if (bank == 0) {
                     int base = DM_GAME_NVN_SSBO_BASE(nvn_stage);   // game profile nvn_ssbo_bases (Mario: vertex 0x110, pixel 0x510, compute 0x310)
                     if (base < 0) RED_ONCE(45, "阶段 %d 的着色器读驱动段 c0，存储缓冲表基址未实测", nvn_stage);
                     else for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[nvn_stage][r].addr; uint32_t n = (uint32_t)S.ssbo[nvn_stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
-                    if (nvn_stage == 5) { uint32_t gx = g_dispatch_grid[0] & 0xffff; memcpy(d + 0x200, &gx, 4); }   // the dispatch's grid width (Link's Awakening light culling: tile row = group y × (c0[0x200] & 0xffff))
+                    // Compute also has the dispatch size at 0x200 (x, y, z) and the uniform buffer table at 0x210 + 16 r (address 64 bits, size 32 bits), ending where the storage buffer table
+                    // starts (0x310). Measured on Link's Awakening's light culling (light_culling_compute.bfsha): tile index = workgroup y × c0[0x200] + workgroup x, and c0[0x280] is
+                    // the address of uniform buffer 7 (the light parameters, 144 bytes per light); Breath of the Wild's compute shaders read 0x280 / 0x290 / 0x2d0 of the same table
+                    if (nvn_stage == 5) {
+                        memcpy(d + 0x200, g_dispatch_dim, 12);
+                        for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); }
+                    }
                 } else {
                     for (int r = 0; r < DM_GAME_NVN_TEX_SLOTS; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][r]; memcpy(d + DM_GAME_NVN_TEX_BASE + 8 * r, &th, 4); }
                     for (int r = 0; r < DM_GAME_NVN_IMG_SLOTS; r++) { uint32_t ih = (uint32_t)S.img[nvn_stage][r]; memcpy(d + DM_GAME_NVN_IMG_BASE + 8 * r, &ih, 4); }   // This game (NVN 55): texture handle table at 0x20 + 8 r (dm/gfx/tools/dmsh_build.py TEX_BASE)
@@ -3541,7 +3479,7 @@ static void pso_predict_rest(void) {
         if (!fz_next(&cur, &q, &hq, &aq)) break;
         if (hq.op == OP_SET_RT) {
             const p_set_rt *r = aq; memset(cf, 0, sizeof cf); dfull = sfull = 0; samples = 1;
-            for (int i = 0; i < r->n && i < 8; i++) { id<MTLTexture> t = r->color[i] && !rt_dup_slot(r, i) ? tex_mtl(r->color[i]) : nil; if (t) { cf[i] = (uint32_t)rt_view_fmt(t, &r->cview[i], r->has_cview[i]); samples = (uint32_t)t.sampleCount; } }
+            for (int i = 0; i < r->n && i < 8; i++) { id<MTLTexture> t = r->color[i] && !rt_dup_slot(r, i) ? tex_mtl(r->color[i]) : nil; if (t && nvn_fmt_bc(r->color[i]->d.format)) t = nil; if (t) { cf[i] = (uint32_t)rt_view_fmt(t, &r->cview[i], r->has_cview[i]); samples = (uint32_t)t.sampleCount; } }   // BC targets are never attached (see attach)
             id<MTLTexture> dt = r->depth ? tex_mtl(r->depth) : nil;
             if (dt) { MTLPixelFormat f = dt.pixelFormat; samples = (uint32_t)dt.sampleCount;
                 dfull = f != MTLPixelFormatStencil8 ? (uint32_t)f : 0; sfull = (f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) ? (uint32_t)f : 0; }
@@ -5002,7 +4940,6 @@ frz_plain:;
     if (moff != g_ui_moff) { g_ui_moff = moff; g_args_dirty[0] = 1; }
     { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1] + vo, S.vp[0][2], S.vp[0][3] * vs, S.dr[0], S.dr[1]} : (MTLViewport){0, vo, tw, th * vs, 0, 1};
       if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { v.originY += v.height; v.height = -v.height; }   // lower-left origin (see g_origin_ll)
-      if (atomic_load_explicit(&g_depth_zero, memory_order_relaxed)) v.znear = 2 * v.znear - v.zfar;   // near = 0 depth mode (see g_depth_zero)
       enc_r_viewport(en, v); }
     MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) {
@@ -5238,7 +5175,6 @@ static void bright_lut(NvShader *cs) {
 }
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
-    g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     if (!S.prog) { RED_ONCE(27, "派发前没有绑定程序"); return; }
     NvShader *cs = prog_get(S.prog)->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
@@ -5274,6 +5210,7 @@ static void dispatch(const p_dispatch *dp) {
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = pg_compute();
     enc_c_pso(ce, ps);
+    g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     encode_args(ce, cs, 5, 0);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     enc_c_end(ce);
@@ -5341,20 +5278,6 @@ static void copy_b2t(const p_copy_b2t *c) {
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(23, "缓冲→贴图拷贝的源不在内存池里"); return; }
-    uint32_t upf; int ubpp;
-    if (bc_unpack(c->tex->d.format, &upf, &ubpp)) {   // No BC: the compressed blocks in the source are decompressed on the CPU into a temporary buffer, then copied pixel-wise into the decompressed-format texture
-        const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents];
-        if (!src) { RED_ONCE(46, "无 BC 解压：缓冲→贴图拷贝的源缓冲 CPU 读不到"); return; }
-        size_t up = (size_t)c->r.width * ubpp, uimg = up * c->r.height;
-        id<MTLBuffer> tb = [g_dev newBufferWithLength:uimg * nz ?: 16 options:MTLResourceStorageModeShared];
-        for (int z = 0; z < nz; z++) nvn_bc_decode(c->tex->d.format, src + mo + z * img, row, c->r.width, c->r.height, (uint8_t *)tb.contents + z * uimg, up);
-        res_add(tb);
-        id<MTL4ComputeCommandEncoder> b = blit();
-        if (is3d) enc_b_copy_buffer_texture(b, tb, 0, up, uimg, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
-        else for (int z = 0; z < nz; z++) enc_b_copy_buffer_texture(b, tb, z * uimg, up, uimg, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
-        defer_obj_release(tb);   // Release after this submit has finished running (and remove from residency)
-        return;
-    }
     id<MTL4ComputeCommandEncoder> b = blit();
     if (is3d)
         enc_b_copy_buffer_texture(b, (__bridge id<MTLBuffer>)mb, mo, row, img, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
@@ -5363,40 +5286,12 @@ static void copy_b2t(const p_copy_b2t *c) {
             enc_b_copy_buffer_texture(b, (__bridge id<MTLBuffer>)mb, mo + z * img, row, img, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
 }
 
-// No BC + Legacy Device Pack: the game copies textures from files (already ASTC 4x4) whole into a BC3 texture array it creates itself (created as RGBA8 when there is no BC). On Switch the two formats have the same block size and
-// the copy moves raw blocks; here it is changed to a compute kernel that decodes pixel by pixel and writes them in, with sRGB sources first read out as linear values and then encoded back to sRGB values, so the result = the values read in the destination format after moving the blocks as-is
-static const char k_a2u_msl[] =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"static float3 enc(float3 c) { return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
-"kernel void a2u(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint4 *p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
-"  if (g.x >= p[1].x || g.y >= p[1].y) return; float4 v = src.read(g + p[0].xy); if (p[1].z) v.rgb = enc(v.rgb); dst.write(v, g + p[0].zw); }\n";
-static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, int sx, int sy, int dx, int dy, int w, int h) {
-    static int failed; static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at;
-    if (failed) return 0;
-    if (!ps) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_a2u_msl) options:nil error:&e]; id<MTLFunction> f = lib ? [lib newFunctionWithName:@"a2u"] : nil;
-        ps = f ? [g_dev newComputePipelineStateWithFunction:f error:&e] : nil;
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
-        if (!ps || !at) { failed = 1; MLOG("【红】无 BC：ASTC → 解压格式拷贝的计算管线建不出 %s", e.localizedDescription.UTF8String); return 0; } }
-    MTLTextureType tt = MTLTextureType2D;
-    id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:tt levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)];
-    id<MTLTexture> dv = [d newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:tt levels:NSMakeRange(dl, 1) slices:NSMakeRange(ds, 1)];
-    id<MTLBuffer> pb = [g_dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
-    if (!sv || !dv || !pb) { RED_ONCE(47, "无 BC：ASTC → 解压格式拷贝建不出视图 / 参数块"); return 0; }
-    uint32_t *p = pb.contents; p[0] = sx; p[1] = sy; p[2] = dx; p[3] = dy; p[4] = w; p[5] = h; p[6] = s.pixelFormat == MTLPixelFormatASTC_4x4_sRGB; p[7] = 0;
-    res_add(pb);
-    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    id<MTL4ComputeCommandEncoder> ce = (id<MTL4ComputeCommandEncoder>)enc_c_begin(NULL); [ce setArgumentTable:at];
-    [at setTexture:sv.gpuResourceID atIndex:0]; [at setTexture:dv.gpuResourceID atIndex:1]; [at setAddress:pb.gpuAddress atIndex:0];
-    enc_c_pso(ce, ps); enc_c_dispatch(ce, MTLSizeMake((w + 7) / 8, (h + 7) / 8, 1), MTLSizeMake(8, 8, 1)); enc_c_end(ce);
-    args_dirty_all();
-    defer_obj_unref(sv); defer_obj_unref(dv); defer_obj_release(pb);   // Release after this submit has finished running (views are not made resident separately; the parameter block is removed from residency)
-    return 1;
-}
 // Texture copies a blit cannot do -- a format change, a scaled region or a mirrored one (MIRROR_X / MIRROR_Y) (Link's Awakening converts its 1408x792 RG11B10F scene to RGBA16F every frame; Super Mario 3D World scales 1920x1080 to 1280x720
 // when leaving the title): one render pass per layer that draws the source region into the destination region, nearest or (LINEAR_FILTER) bilinear. Float, unorm and sRGB formats only, 2D / 2D array,
 // destinations that can be render targets; anything else returns 0 and keeps the red line. Depth (Depth32Float / Depth32Float_Stencil8 into the same format) is drawn by writing depth from the fragment shader,
-// always nearest; Depth32Float_Stencil8 also carries the stencil (read through an X32_Stencil8 view, written with [[stencil]]). Link's Awakening halves its depth-stencil buffer twice for post-processing and
-// selects pixels by stencil bit 1 there; with the stencil left uninitialized its ambient-occlusion mask pass drew nothing
+// always nearest, and stencil is written from the fragment shader too ([[stencil]] export, read through an X32_Stencil8 view of the source). Link's Awakening halves its depth-stencil buffer twice
+// (1920x1080 → 960x540 → 480x270) and its depth-of-field mask pass only writes where stencil bit 1 is clear: with the stencil left as the new texture's undefined content, the mask kept its
+// clear value 1.0 (full blur) everywhere and the whole picture was out of focus. Without a stencil view the stencil is cleared to 0 instead
 static int fmt_int_or_ds(MTLPixelFormat f) {
     switch (f) {
         case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
@@ -5423,28 +5318,32 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
             "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; return t.sample(s, st / p[1].zw, level(0)); }\n"
             "struct D { float d [[depth(any)]]; };\n"
             "fragment D fsd(V in [[stage_in]], depth2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {\n"
-            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; D o; o.d = t.sample(s, st / p[1].zw, level(0)); return o; }\n"
-            "struct DS { float d [[depth(any)]]; uint s [[stencil]]; };\n"   // depth + stencil: the stencil view holds the value in r
-            "fragment DS fsds(V in [[stage_in]], depth2d<float> t [[texture(0)]], texture2d<uint> sv [[texture(1)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {\n"
-            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; DS o; o.d = t.sample(s, st / p[1].zw, level(0)); o.s = sv.read(uint2(clamp(st, 0.0, p[1].zw - 1.0))).r; return o; }\n";
+            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; D o; o.d = t.read(uint2(st)); return o; }\n"
+            "struct DS { float d [[depth(any)]]; uint s [[stencil]]; };\n"
+            "fragment DS fsds(V in [[stage_in]], depth2d<float> t [[texture(0)]], texture2d<uint> ts [[texture(1)]], constant float4 *p [[buffer(0)]]) {\n"
+            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; DS o; o.d = t.read(uint2(st)); o.s = ts.read(uint2(st)).r; return o; }\n";
         NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:nil error:&e];
         vf = [lib newFunctionWithName:@"vs"]; ff = [lib newFunctionWithName:@"fs"]; fd = [lib newFunctionWithName:@"fsd"]; fds = [lib newFunctionWithName:@"fsds"];
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES; dss = [g_dev newDepthStencilStateWithDescriptor:dd];
-        MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionAlways; sd.depthStencilPassOperation = MTLStencilOperationReplace; sd.readMask = sd.writeMask = 0xff;
-        dd.frontFaceStencil = dd.backFaceStencil = sd; dss_s = [g_dev newDepthStencilStateWithDescriptor:dd];   // the exported stencil value replaces the reference
+        MTLStencilDescriptor *sd_ = [MTLStencilDescriptor new]; sd_.stencilCompareFunction = MTLCompareFunctionAlways; sd_.depthStencilPassOperation = MTLStencilOperationReplace;   // Replace writes the [[stencil]] output
+        dd.frontFaceStencil = dd.backFaceStencil = sd_; dss_s = [g_dev newDepthStencilStateWithDescriptor:dd];
         MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         for (int i = 0; i < 2; i++) { MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
             sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES; samp[i] = [g_dev newSamplerStateWithDescriptor:sd]; }
         if (!vf || !ff || !fd || !fds || !dss || !dss_s || !at || !samp[0] || !samp[1]) { failed = 1; MLOG("【红】换格式 / 缩放贴图拷贝的管线建不出：%s", e.localizedDescription.UTF8String); return 0; }
         pso = [NSMutableDictionary dictionary];
     }
-    id<MTLRenderPipelineState> ps = pso[@(d.pixelFormat)];
+    // Stencil: read through a stencil-only view of the source (one per layer below); without one it is cleared to 0
+    id<MTLTexture> stv0 = stencil && s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset, 1)] : nil;
+    int scopy = stv0 != nil;
+    NSNumber *pk = @(d.pixelFormat * 2 + scopy);
+    id<MTLRenderPipelineState> ps = pso[pk];
     if (!ps) {
-        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = stencil ? fds : depth ? fd : ff;
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = depth ? (scopy ? fds : fd) : ff;
         if (depth) { pd.depthAttachmentPixelFormat = d.pixelFormat; if (stencil) pd.stencilAttachmentPixelFormat = d.pixelFormat; } else pd.colorAttachments[0].pixelFormat = d.pixelFormat;
         NSError *e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!ps) { RED_ONCE(83, "换格式 / 缩放贴图拷贝：目标格式 %lu 的管线建不出：%s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
-        pso[@(d.pixelFormat)] = ps;
+        pso[pk] = ps;
     }
     unsigned sw = MAX(s.width >> sl, 1ul), sh = MAX(s.height >> sl, 1ul), dw = MAX(d.width >> dl, 1ul), dh = MAX(d.height >> dl, 1ul);
     if ((unsigned)(dr->xoffset + dr->width) > dw || (unsigned)(dr->yoffset + dr->height) > dh) return 0;
@@ -5452,9 +5351,8 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     for (int z = 0; z < nz; z++) {
         id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset + z, 1)];
-        id<MTLTexture> svs = stencil ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset + z, 1)] : nil;
         id<MTLBuffer> pb = [g_dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
-        if (!sv || !pb || (stencil && !svs)) { RED_ONCE(84, "换格式 / 缩放贴图拷贝：建不出源视图 / 参数块"); return z > 0; }
+        if (!sv || !pb) { RED_ONCE(84, "换格式 / 缩放贴图拷贝：建不出源视图 / 参数块"); return z > 0; }
         float *p = pb.contents; p[0] = sr->xoffset; p[1] = sr->yoffset; p[2] = (float)sr->width / dr->width; p[3] = (float)sr->height / dr->height;
         if (mirror & NVN_COPY_FLAGS_MIRROR_X_BIT) { p[0] += sr->width; p[2] = -p[2]; }   // mirrored: walk the source region from its far edge
         if (mirror & NVN_COPY_FLAGS_MIRROR_Y_BIT) { p[1] += sr->height; p[3] = -p[3]; }
@@ -5463,19 +5361,20 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         MTLRenderPassAttachmentDescriptor *a = depth ? (MTLRenderPassAttachmentDescriptor *)rp.depthAttachment : (MTLRenderPassAttachmentDescriptor *)rp.colorAttachments[0];
         a.texture = d; a.level = dl; a.slice = ds + dr->zoffset + z; a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionStore;
-        if (stencil) { MTLRenderPassStencilAttachmentDescriptor *st = rp.stencilAttachment; st.texture = d; st.level = dl; st.slice = a.slice; st.loadAction = MTLLoadActionLoad; st.storeAction = MTLStoreActionStore; }
+        id<MTLTexture> stv = scopy ? (z ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset + z, 1)] : stv0) : nil;
+        if (stencil) { MTLRenderPassStencilAttachmentDescriptor *st = rp.stencilAttachment; st.texture = d; st.level = dl; st.slice = a.slice; st.loadAction = scopy ? MTLLoadActionLoad : MTLLoadActionClear; st.clearStencil = 0; st.storeAction = MTLStoreActionStore; }
         ser_gate(); id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
-        if (depth) [en setDepthStencilState:stencil ? dss_s : dss];
+        if (depth) [en setDepthStencilState:scopy ? dss_s : dss];
         [en setArgumentTable:at atStages:MTLRenderStageFragment];
-        [at setTexture:sv.gpuResourceID atIndex:0]; if (svs) [at setTexture:svs.gpuResourceID atIndex:1]; [at setSamplerState:samp[!!linear && !depth].gpuResourceID atIndex:0]; [at setAddress:pb.gpuAddress atIndex:0];
+        [at setTexture:sv.gpuResourceID atIndex:0]; if (stv) [at setTexture:stv.gpuResourceID atIndex:1]; [at setSamplerState:samp[!!linear && !depth].gpuResourceID atIndex:0]; [at setAddress:pb.gpuAddress atIndex:0];
         [en setViewport:(MTLViewport){dr->xoffset, dr->yoffset, dr->width, dr->height, 0, 1}];
         [en setScissorRect:(MTLScissorRect){(NSUInteger)dr->xoffset, (NSUInteger)dr->yoffset, (NSUInteger)dr->width, (NSUInteger)dr->height}];
         [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; enc_r_end(en);
-        defer_obj_unref(sv); if (svs) defer_obj_unref(svs); defer_obj_release(pb);   // released after this submission has run
+        defer_obj_unref(sv); if (stv) defer_obj_unref(stv); defer_obj_release(pb);   // released after this submission has run
     }
     args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
     { static int once[2]; if (!once[depth]++) MLOG("换格式 / 缩放贴图拷贝：首例 %dx%d 格式 %lu → %dx%d 格式 %lu%s%s", sr->width, sr->height, (unsigned long)s.pixelFormat, dr->width, dr->height, (unsigned long)d.pixelFormat,
-                                                    linear && !depth ? "（双线性）" : "", stencil ? "（深度连模板）" : ""); }
+                                                    linear && !depth ? "（双线性）" : "", stencil ? (scopy ? "（深度 + 模板）" : "（模板建不出视图，清成 0）") : ""); }
     return 1;
 }
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
@@ -5518,12 +5417,6 @@ static void copy_t2t(const p_copy_t2t *c) {
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
-    if (no_bc() && (s.pixelFormat == MTLPixelFormatASTC_4x4_LDR || s.pixelFormat == MTLPixelFormatASTC_4x4_sRGB) && (d.pixelFormat == MTLPixelFormatRGBA8Unorm || d.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB)
-        && !s3 && !d3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && (d.usage & MTLTextureUsageShaderWrite)) {   // No BC: ASTC source -> decompressed-format destination (see copy_t2t_astc)
-        int ok = 1;
-        for (int z = 0; z < nz && ok; z++) ok = copy_t2t_astc(s, d, sl, sz0 + c->sr.zoffset + z, dl, dz0 + c->dr.zoffset + z, c->sr.xoffset, c->sr.yoffset, c->dr.xoffset, c->dr.yoffset, c->sr.width, c->sr.height);
-        if (ok) return;
-    }
     if ((c->sr.width != c->dr.width || c->sr.height != c->dr.height || s.pixelFormat != d.pixelFormat || (c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT))) && !s3 && !d3
         && (c->sr.depth ? c->sr.depth : 1) == (c->dr.depth ? c->dr.depth : 1)
         && !(c->flags & ~(NVN_COPY_FLAGS_ENGINE_2D_BIT | NVN_COPY_FLAGS_LINEAR_FILTER_BIT | NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT))
@@ -6082,7 +5975,7 @@ void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
         id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
         uint64_t ser = i < (NSUInteger)R.rt.n && R.rt.color[i] ? R.rt.color[i]->serial : 0;
         NSUInteger lv = pd.colorAttachments[i].level, sl = t.textureType == MTLTextureType2DArray ? pd.colorAttachments[i].slice : 0;
-        BOOL seen = NO; for (NSArray *e in g_td_list) if ([e[1] unsignedLongLongValue] == ser && [e[2] unsignedIntegerValue] == lv && [e[3] unsignedIntegerValue] == sl) seen = YES;
+        BOOL seen = NO; for (NSArray *e in g_td_list) if (e.count < 5 && [e[1] unsignedLongLongValue] == ser && [e[2] unsignedIntegerValue] == lv && [e[3] unsignedIntegerValue] == sl) seen = YES;
         if (!seen) [g_td_list addObject:@[t, @(ser), @(lv), @(sl)]];
     }
 }
@@ -6120,7 +6013,8 @@ static void td_dump(void) {
         size_t row = w * bpp, img = row * h;
         id<MTLBuffer> buf = [g_dev newBufferWithLength:img * dz options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:img];
+        MTLBlitOption bo = t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;   // depth-stencil: the 32-bit float depth plane only
+        [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, dz) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:img options:bo];
         [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
         char path[1024]; snprintf(path, sizeof path, g_td_path, (int)ser); strlcat(path, ".raw", sizeof path);
         FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu %zu\n", (unsigned long)w, (unsigned long)h, (unsigned long)dz, (unsigned long)t.pixelFormat, row); fwrite(buf.contents, 1, img * dz, f); fclose(f); }
@@ -6152,13 +6046,15 @@ static void td_dump(void) {
         [en setRenderPipelineState:ps]; [en setFragmentTexture:v atIndex:0]; [en setFragmentSamplerState:sp atIndex:0];
         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
         char path[1024]; snprintf(path, sizeof path, g_td_path, (int)(ser * 100 + sl * 10 + lv));
+        if (e.count > 4) { snprintf(path, sizeof path, g_td_path, 0); char *dot = strrchr(path, '.'); char ext[16] = ""; if (dot) { strlcpy(ext, dot, sizeof ext); *dot = 0; }
+            char tail[64]; snprintf(tail, sizeof tail, "_s%03d_%llu_%lu%s", [e[4] intValue], (unsigned long long)ser, (unsigned long)lv, ext); strlcat(path, tail, sizeof path); }   // TEXSNAP copy
         MLOG("[texdump] ser=%llu lv=%lu 层 %lu 格式 %lu %lux%lu", ser, (unsigned long)lv, (unsigned long)sl, (unsigned long)t.pixelFormat, (unsigned long)w, (unsigned long)h);
         shot(o, path, 0, NULL);
     }
     [g_td_list removeAllObjects];
 }
 // DM_NVN_TEXSNAP=in-frame index,... (together with the frame number and path of DM_NVN_TEXDUMP): as soon as these render passes end, copy their color attachments and save them together with the end-of-frame dump
-// (the same target is often cleared and reused within a frame, so the end-of-frame state cannot reflect the output of intermediate passes); file name index = in-frame index*100000 + texture index*100 + mip level
+// (the same target is often cleared and reused within a frame, so the end-of-frame state cannot reflect the output of intermediate passes); saved as <TEXDUMP path with %d = 0>_s<in-frame index>_<serial>_<level>.png
 static int g_ts_idx[64], g_ts_n = -1, g_ts_on; static uint64_t g_ts_first, g_ts_curf = ~0ull;
 static __strong id<MTLTexture> g_ts_att[8]; static uint64_t g_ts_ser[8]; static NSUInteger g_ts_lv[8]; static int g_ts_na;
 void ts_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
@@ -6182,7 +6078,7 @@ void ts_after(void) {
         id<MTLTexture> c = [g_dev newTextureWithDescriptor:d];
         id<MTLBlitCommandEncoder> b = [dcb blitCommandEncoder];
         [b copyFromTexture:t sourceSlice:0 sourceLevel:g_ts_lv[i] toTexture:c destinationSlice:0 destinationLevel:g_ts_lv[i] sliceCount:1 levelCount:1]; [b endEncoding];
-        [g_td_list addObject:@[c, @((uint64_t)(g_ts_on - 1) * 1000 + g_ts_ser[i]), @(g_ts_lv[i])]];
+        [g_td_list addObject:@[c, @(g_ts_ser[i]), @(g_ts_lv[i]), @0, @(g_ts_on - 1)]];   // the end-of-frame fields (texture, serial, level, layer) plus the in-frame pass index: saved as <path with %d = 0>_s<index>_<serial>_<level>.png
     }
     g_ts_on = 0;
     [dcb commit];
@@ -6440,7 +6336,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; } pq_item;   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val; } pq_item;   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+// External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
+static id<MTLSharedEvent> g_ext_ev;
+static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
@@ -6483,6 +6382,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
+    ext_wait(it.ev_val);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
@@ -6563,6 +6463,7 @@ static void *present_main(void *arg) {
         uint64_t ticket = ++g_pq_read; g_classic_busy = 1;
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
+        ext_wait(it.ev_val);
         @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
@@ -6582,7 +6483,21 @@ void mtl_link_pause(int on);
 // When turned on, also clear the frames already queued: the system first stops the display-link callback and only afterwards notifies about going to the background, and in that gap the game has already filled the swapchain and is stuck at "before acquiring the next texture, wait for its previous present to be processed"
 // (hle_nvn.c nvnWindowAcquireTexture -> mtl_present_wait). Without clearing, the game cannot advance a single tick during those 2.5 seconds of waiting for the save, and the save is not written (the same pattern three times in player logs: 3 frames queued, 0 submits)
 void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if (on) present_drop_for_suspend(); }
-uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val);
+uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) { return present_enqueue(t, period, crop, 0); }
+void *mtl_device(void) { mtl_init(); return (__bridge void *)g_dev; }
+// An external producer's texture (the Vulkan layer's swapchain images): a serial the present path resolves (serial_put), resident for the Metal 4 queue, never collected by the cross-submit ledger
+uint64_t mtl_ext_tex(void *tex) {
+    static _Atomic uint64_t n; id<MTLTexture> t = (__bridge id<MTLTexture>)tex; uint64_t ser = (1ull << 62) + atomic_fetch_add(&n, 1) + 1;
+    res_add(t); serial_put(ser, t); mtl_xv_window_tex(ser); return ser;
+}
+// Present an external texture after the producer's event reaches ev_val (its rendering of the frame is done); returns the ticket for mtl_present_wait
+uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val) {
+    tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = serial;
+    if (ev && !g_ext_ev) g_ext_ev = (__bridge id<MTLSharedEvent>)ev;
+    return present_enqueue(&t, period, NULL, ev ? ev_val : 0);
+}
+static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
     if (atomic_load(&g_present_discard)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "出图"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
@@ -6595,7 +6510,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime()};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     pthread_cond_broadcast(&g_pq_cv);

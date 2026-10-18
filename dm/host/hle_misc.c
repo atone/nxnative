@@ -92,6 +92,11 @@ HLE_FORCE("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_", "服务器名解析，联网排
 HLE_FORCE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", "服务器名解析，联网排除；剪口", Result, h_nsd_ResolveEx, void *out, const void *in) { (void)out; (void)in; return RES_FAIL; }
 // bool arguments only look at the low 8 bits; returns bool
 HLE_FORCE("_ZN2nn4pctl25TryBeginFreeCommunicationEb", "家长控制·与他人通信，联网排除；恒不允许", unsigned, h_pctl_TryBegin, unsigned show_ui) { (void)show_ui; return 0; }
+// Parental control of the 3D (VR goggles) mode, Super Mario Odyssey: no restriction, nothing to configure
+HLE_FORCE("_ZN2nn4pctl26GetStereoVisionRestrictionEv", "家长控制·3D 画面限制；恒不限制", unsigned, h_pctl_GetStereo, void) { return 0; }
+HLE_FORCE("_ZN2nn4pctl26SetStereoVisionRestrictionEb", "家长控制·3D 画面限制；宿主不存", void, h_pctl_SetStereo, unsigned on) { (void)on; }
+HLE_FORCE("_ZN2nn4pctl42ConfirmStereoVisionRestrictionConfigurableEv", "家长控制·3D 画面限制能否改；能", Result, h_pctl_ConfStereo, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn4pctl53RequestStereoVisionRestrictionConfigurationPermissionEv", "家长控制·改 3D 限制的许可；直接许可", Result, h_pctl_ReqStereo, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4pctl20EndFreeCommunicationEv", "家长控制·与他人通信", void, h_pctl_End, void) {}
 // Engage asks on entering a battle map (no UI); without this the SDK connects to the pctl service through sm, which the host does not have, and aborts
 HLE_FORCE("_ZN2nn4pctl28IsFreeCommunicationAvailableEv", "家长控制·与他人通信可用否，联网排除；恒否", unsigned, h_pctl_IsFree, void) { return 0; }

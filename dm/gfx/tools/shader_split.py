@@ -10,6 +10,8 @@
 #   · Unity (UnityFS bundles and the serialized files under Data, read by unityfs.py): the Switch subprograms of each Shader object; the program code = a 0x60 header + one block per stage.
 #       The header is 4 i32 ×6 arrays indexed by NVN stage (0 vertex 1 pixel 2 geometry 3 hull 4 domain 5 compute): [0] unused (0 or a scratch size), [1] block offset (from +0x60, -1 = no such stage), [2] control length, [3] code length;
 #       block = control section + code area. A program's vertex / pixel stages form a pair. The game's own serialized files (data.unity3d, unity default resources) carry no type trees and borrow the bundles' Shader type tree of the same hash (second pass)
+#       Before 2019.3 (Cuphead, Unity 2017.4; found by armyja, GitHub pull request #2) a subprogram holds one stage: program code = a 0x10 header {?, ?, control length, code length} + control section
+#       + code area, and the stage is not in the code but in the Shader's m_ParsedForm (unity_stages)
 #   · MSHD (MercurySteam, Metroid Dread system/shd/*.bshdat): each stage = a control section (+0x20 = control length; sometimes a small compiler option table follows) + the code area starting at the next code header;
 #       NV assembly text follows the first 0x880 bytes of the control section, and SASS disassembly text follows the code area. All 478 files hold "vertex, pixel" in pairs (1, 2 or 4 pairs), paired two by two in order
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
@@ -158,8 +160,16 @@ def _pool_init(common, trees):
     global COMMON, TREES
     COMMON, TREES = common, trees
 
-def unity_program(code, where):
-    """Unity's Switch program code → [(stage, control, code)]"""
+def unity_program(code, where, stage=None):
+    """Unity's Switch program code → [(stage, control, code)]; stage = the subprogram's stage from m_ParsedForm, which only the pre-2019.3 layout needs"""
+    if len(code) >= 0x14 and code[0x10:0x14] == CTL_MAGIC:   # before 2019.3: 0x10 header + control section + code area, one stage
+        if stage is None: red(f'{where}：2019.3 之前的子程序，m_ParsedForm 里查不到它的阶段')
+        nctl, ncode = struct.unpack_from('<2i', code, 8); a = 0x10; end = a + nctl + ncode
+        ctl, cd = code[a:a + nctl], code[a + nctl:end]
+        why = check(where, stage, ctl, cd) if end <= len(code) else '块越界'
+        if why: red(f'{where} {stage}：{why}')
+        if end != len(code): red(f'{where}：程序代码 {len(code):#x} 字节，控制段 + 代码区只到 {end:#x}')
+        return [(stage, ctl, cd)]
     h = struct.unpack_from('<24i', code, 0); out = []; end = 0x60
     for i, st in enumerate(NV_STAGES):
         off, nctl, ncode = h[6 + i], h[12 + i], h[18 + i]
@@ -171,6 +181,15 @@ def unity_program(code, where):
     if end != len(code): red(f'{where}：程序代码 {len(code):#x} 字节，各阶段块只到 {end:#x}')
     return out
 
+def unity_stages(o):
+    """Shader object → {subprogram index: stage}, from the passes of m_ParsedForm (progVertex / progFragment / ... m_SubPrograms[].m_BlobIndex)"""
+    m = {}
+    for sub in (o.get('m_ParsedForm') or {}).get('m_SubShaders', []):
+        for p in sub.get('m_Passes', []):
+            for field, st in (('progVertex', 'vs'), ('progFragment', 'ps'), ('progGeometry', 'gs'), ('progHull', 'hs'), ('progDomain', 'ds')):
+                for sp in (p.get(field) or {}).get('m_SubPrograms', []): m.setdefault(sp.get('m_BlobIndex'), st)
+    return m
+
 def unity_shaders(d, label, out, trees):
     """Shaders in a UnityFS bundle or serialized file → out; raises NoTree when no type tree is available"""
     import unityfs
@@ -180,10 +199,11 @@ def unity_shaders(d, label, out, trees):
         if not unityfs.is_serialized(x): continue
         for cid, pid, o in unityfs.serialized_objects(x, COMMON, {unityfs.CLASS_SHADER}, trees):
             name = o['m_ParsedForm']['m_Name'] if 'm_ParsedForm' in o else o.get('m_Name', '?')
+            stages = unity_stages(o)
             for plat, k, sp in unityfs.shader_programs(o):
                 where = f'{label}{":" + node if node else ""}#{name}#var{plat}.{k}'
                 code = unityfs.subprogram(sp)[4]
-                out.extend((where, st, ctl, cd) for st, ctl, cd in unity_program(code, where))
+                out.extend((where, st, ctl, cd) for st, ctl, cd in unity_program(code, where, stages.get(k)))
 
 def scan_blob(d, label, out):
     if d[:4] == b'Yaz0': d = yaz0(d)
@@ -321,6 +341,11 @@ def main():
         f.write('# 第 5 列记每个键首次出现的位置；本作没有 PC 版配对\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')
         for r in rows: f.write('\t'.join(map(str, r)) + '\n')
+    # Hand-written facts the machine code cannot give (the profile's shader_facts_manual.tsv, same row format) are merged over the generated ones, so the table stays reproducible
+    manual = GAME.table('shader_facts_manual.tsv')
+    if os.path.exists(manual):
+        for ln in open(manual):
+            if ln.strip() and not ln.startswith('#'): k, v = ln.rstrip('\n').split('\t', 1); facts[k] = {**facts.get(k, {}), **json.loads(v)}
     with open(factsout, 'w') as f:
         f.write('# 翻译查询的作答表（dm/gfx/tools/shader_split.py 生成，勿手改）：键 <TAB> 事实 JSON。本作没有 PC 版可配对：只有计算着色器的线程组 / 共享内存（取自控制段），其余查询按翻译器缺省\n')
         for k in sorted(facts): f.write(k + '\t' + json.dumps(facts[k], sort_keys=True, separators=(',', ':')) + '\n')

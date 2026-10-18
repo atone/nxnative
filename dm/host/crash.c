@@ -151,6 +151,14 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
+    // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class
+    for (int i = 0; i < 29; i++) {
+        uint64_t a = uc->uc_mcontext->__ss.__x[i], w[6]; vm_size_t got = 0;
+        if (a < 0x100000000ull || (a & 7) || vm_read_overwrite(mach_task_self(), (vm_address_t)a, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) continue;
+        fprintf(stderr, "[dm] *x%d:", i);
+        for (int k = 0; k < 6; k++) off("", w[k]);
+        fputc('\n', stderr);
+    }
     dm_backtrace(uc->uc_mcontext->__ss.__fp);
     // Stack scan: when the frame chain is broken (a return address was overwritten, pc = lr lands on garbage) the backtrace prints nothing; scan 512 words up from sp and list everything that resolves to a module / host symbol (nearest callers first)
     {   uint64_t sp = uc->uc_mcontext->__ss.__sp;   // The frame just popped (when a return address was overwritten, the bad value and the leftovers of whatever overwrote it sit below sp)

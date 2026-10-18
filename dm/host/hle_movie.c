@@ -1,12 +1,13 @@
 // The SDK's movie library (subsdk0 = NintendoSDK_movie, Engage): Extractor demuxes, Decoder uses NVIDIA's hardware decoder (NVOMX → NvRmChannelOpen opens the nvdrv device).
 // The host has no nvdrv: the SDK aborts when the decoder thread opens the device. Extractor::SetDataSource returns 0x1000 (the same code the SDK returns when it has no implementation object); Engage's Unity demuxes WebM itself and does not use it.
-// The host takes over Decoder (below; VP9 is decoded with libvpx, Vorbis audio with stb_vorbis): Engage's movies are 103 VP9 WebM files under RomFS/Data/StreamingAssets/Movie (2.7 GB, no audio track), and the game does not go on until the opening movie S01F has played.
+// The host takes over Decoder (below; VP9 is decoded with libvpx, H.264 with VideoToolbox in hle_movie_avc.c, Vorbis audio with stb_vorbis): Engage's movies are 103 VP9 WebM files under RomFS/Data/StreamingAssets/Movie (2.7 GB, no audio track), and the game does not go on until the opening movie S01F has played.
 #include "hle.h"
 #include <arm_neon.h>
 #include <pthread.h>
 #include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
+#include "hle_movie_avc.h"   // H.264 on VideoToolbox
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -47,6 +48,7 @@ HLE_FORCE("_ZN5movie9Extractor13SetDataSourceEPKc", "影片拆封装：宿主还
 #define MD_FMT_NV12 4
 #define MD_FMT_ABGR 3            // 4-byte RGBA (memory order R G B A), only with the native texture mode
 #define MD_MODE_TEX 2            // native texture mode: the decoder writes frames into the client's NVN texture
+#define MD_TYPE_AVC 1
 #define MD_TYPE_VP9 3
 #define MD_TYPE_VORBIS 5         // audio: the SDK's Decoder accepts AAC (4) and Vorbis (5) in CPU mode, output format 1 only (interleaved PCM16)
 #define MD_FMT_PCM16 1
@@ -63,7 +65,8 @@ typedef struct {
     struct { int in, off, size; int64_t pts; uint32_t flags; } pend[MD_NIN]; int npend;   // input packets waiting to be decoded (in arrival order)
     // Decoding: dmu lets only one guest thread take and decode packets at a time (packets enter libvpx in order); wmu / wcv hand one job to the host thread and wait for it
     pthread_mutex_t dmu, wmu; pthread_cond_t wcv; pthread_t wk;
-    int job; const uint8_t *jp; int jn, jslot, jgot;
+    int job; const uint8_t *jp; int jn, jslot, jgot; int64_t jpts, jpts_out; int jflush;
+    mavc *avc; int avc_drain;                    // H.264 (hle_movie_avc.c); avc_drain: the end-of-stream packet came with pictures still queued, they leave one per free slot
     vpx_codec_ctx_t vpx; int vpx_on, red_dec, red_img;
     // Vorbis: the identification and setup headers from Configure's MediaData ("csd-0", "csd-1", as with Android's MediaCodec), the decoder (opened at the first packet), channels / rate, Ogg page sequence
     uint8_t *vhdr[2]; int vhdr_n[2]; stb_vorbis *vb; int ch, rate; uint32_t ogg_seq; int64_t ogg_gran; int red_vb;
@@ -181,7 +184,7 @@ static void md_dims(const mdec_t *d, int *w, int *h, int *stride, int *slice) {
 }
 
 // ---------- Host decoding thread ----------
-enum { MDJ_NONE, MDJ_DECODE, MDJ_CLOSE, MDJ_QUIT };
+enum { MDJ_NONE, MDJ_DECODE, MDJ_CLOSE, MDJ_QUIT, MDJ_TAKE };
 static int md_threads(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n >= 8 ? 4 : 2; }
 // I420 → NV12 (stride = width, plane height = height); a smaller picture is padded with black, a larger one cropped
 static void md_nv12(const vpx_image_t *im, uint8_t *dst, int w, int h) {
@@ -290,7 +293,16 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
     d->out[slot].bytes = need;
     return 1;
 }
-static void md_close(mdec_t *d) { if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } }
+// H.264: decode the packet (if any) and hand out the next picture in presentation order (with jflush every queued one in turn); 1 = a picture is in the slot, its time in jpts_out
+static int md_avc(mdec_t *d, const uint8_t *p, int n, int slot, int take_only) {
+    if (!d->avc) d->avc = mavc_new();
+    if (!take_only && n > 0) mavc_decode(d->avc, p, n, d->jpts);
+    if (d->w <= 0 || d->h <= 0) return 0;
+    size_t need = (size_t)d->w * d->h * 3 / 2;
+    if (d->out[slot].cap < need) { free(d->out[slot].frm); d->out[slot].frm = malloc(need); d->out[slot].cap = need; }
+    return mavc_take(d->avc, d->jflush, d->out[slot].frm, d->w, d->h, &d->jpts_out);
+}
+static void md_close(mdec_t *d) { if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } if (d->avc) { mavc_free(d->avc); d->avc = NULL; } }
 static void *md_worker(void *arg) {
     mdec_t *d = arg;
     pthread_setname_np("dm 影片解码 | movie decoder");
@@ -299,9 +311,9 @@ static void *md_worker(void *arg) {
         while (d->job == MDJ_NONE) pthread_cond_wait(&d->wcv, &d->wmu);
         int job = d->job;
         pthread_mutex_unlock(&d->wmu);
-        if (job == MDJ_DECODE) {
+        if (job == MDJ_DECODE || job == MDJ_TAKE) {
             uint64_t t0 = now_ns();
-            d->jgot = d->type == MD_TYPE_VORBIS ? md_vorbis(d, d->jp, d->jn, d->jslot) : md_vp9(d, d->jp, d->jn, d->jslot);
+            d->jgot = d->type == MD_TYPE_AVC ? md_avc(d, d->jp, d->jn, d->jslot, job == MDJ_TAKE) : d->type == MD_TYPE_VORBIS ? md_vorbis(d, d->jp, d->jn, d->jslot) : md_vp9(d, d->jp, d->jn, d->jslot);
             uint64_t dt = now_ns() - t0; d->dec_n++; d->dec_ns += dt; if (dt > d->dec_max) d->dec_max = dt;
         }
         else md_close(d);
@@ -324,6 +336,18 @@ static void md_pump(mdec_t *d) {
     pthread_mutex_lock(&d->dmu);
     for (;;) {
         pthread_mutex_lock(&d->mu);
+        if (d->avc_drain) {   // H.264 end of stream: the pictures still queued leave one per free slot; the last carries the end-of-stream flag
+            int s = -1; for (int k = 0; k < MD_NOUT; k++) if (!d->out[k].used) { s = k; break; }
+            if (s < 0) { pthread_mutex_unlock(&d->mu); break; }
+            d->out[s].used = 1; pthread_mutex_unlock(&d->mu);
+            d->jslot = s; d->jflush = 1; md_job(d, MDJ_TAKE); int got = d->jgot, left = d->avc ? mavc_queued(d->avc) : 0;
+            pthread_mutex_lock(&d->mu);
+            d->out[s].pic = got; d->out[s].pts = got ? d->jpts_out : 0; d->out[s].flags = left ? 0 : 4; d->outq[d->noutq++] = s;
+            if (!left) d->avc_drain = 0;
+            pthread_mutex_unlock(&d->mu);
+            md_event(d, 1);
+            continue;
+        }
         int slot = -1;
         if (d->npend) for (int k = 0; k < MD_NOUT; k++) if (!d->out[k].used) { slot = k; break; }
         if (slot < 0) { pthread_mutex_unlock(&d->mu); break; }
@@ -331,14 +355,17 @@ static void md_pump(mdec_t *d) {
         memmove(d->pend, d->pend + 1, --d->npend * sizeof *d->pend);
         d->out[slot].used = 1;
         pthread_mutex_unlock(&d->mu);
-        int got = 0;
-        if (pk.size > 0 && (d->type == MD_TYPE_VP9 || d->type == MD_TYPE_VORBIS)) { d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; md_job(d, MDJ_DECODE); got = d->jgot; }
+        int got = 0, avc = d->type == MD_TYPE_AVC;
         int eos = (pk.flags & 4) != 0;   // MediaCodec BUFFER_FLAG_END_OF_STREAM
+        if ((pk.size > 0 && (d->type == MD_TYPE_VP9 || d->type == MD_TYPE_VORBIS || avc)) || (avc && eos)) {
+            d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; d->jpts = pk.pts; d->jflush = 0; md_job(d, MDJ_DECODE); got = d->jgot; }
+        int more = avc && eos && d->avc && mavc_queued(d->avc) > 0;   // H.264 pictures still queued: they follow this output, the last of them carries the end-of-stream flag
         pthread_mutex_lock(&d->mu);
         d->infree[d->ninfree++] = pk.in;
-        int ready = got || eos || (d->type != MD_TYPE_VP9 && d->type != MD_TYPE_VORBIS);   // an end-of-stream packet without a picture still yields an output to carry the flag back; AVC / VP8 have no decoder and give black frames
-        if (ready) { d->out[slot].pic = got; d->out[slot].pts = pk.pts; d->out[slot].flags = pk.flags; d->outq[d->noutq++] = slot; }
+        int ready = got || eos || (d->type != MD_TYPE_VP9 && d->type != MD_TYPE_VORBIS && !avc);   // an end-of-stream packet without a picture still yields an output to carry the flag back; VP8 has no decoder and gives black frames
+        if (ready) { d->out[slot].pic = got; d->out[slot].pts = got && avc ? d->jpts_out : pk.pts; d->out[slot].flags = more ? pk.flags & ~4u : pk.flags; d->outq[d->noutq++] = slot; }
         else d->out[slot].used = 0;
+        if (more) d->avc_drain = 1;
         pthread_mutex_unlock(&d->mu);
         md_event(d, 0);
         if (ready) md_event(d, 1);
@@ -346,17 +373,18 @@ static void md_pump(mdec_t *d) {
     pthread_mutex_unlock(&d->dmu);
 }
 
-HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", "影片解码器：宿主实现（不建 NVIDIA 硬件解码器，VP9 用 libvpx）",
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", "影片解码器：宿主实现（不建 NVIDIA 硬件解码器，VP9 用 libvpx，AVC 用 VideoToolbox）",
           void, h_movie_Decoder, void **self, int type, int fmt, int mode, int prio) {
     static void *vt; if (!vt) { uint8_t *t = guest_sym("_ZTVN5movie7DecoderE"); if (!t) die("影片：缺 movie::Decoder 的虚表"); vt = t + 0x10; }
     md_syms();
     self[0] = vt; self[1] = NULL;
     // Only video (AVC / VP8 / VP9 = 1..3): NV12 output (Engage's Unity, CPU buffers), or RGBA output into the client's NVN texture (mode 2, Metroid Dread);
-    // anything else (audio) keeps a null impl and every method returns the SDK's failure code. Only VP9 is really decoded; AVC / VP8 give black frames
+    // anything else (audio) keeps a null impl and every method returns the SDK's failure code. VP9 is decoded with libvpx, AVC with VideoToolbox (hle_movie_avc.c); VP8 gives black frames
     // Audio: Vorbis to PCM16 (Link's Awakening's movies carry a Vorbis track; without a decoder the SDK's player plays them silent)
     int audio = type == MD_TYPE_VORBIS && fmt == MD_FMT_PCM16;
     if (!audio && (type < 1 || type > 3 || (fmt != MD_FMT_NV12 && !(fmt == MD_FMT_ABGR && mode == MD_MODE_TEX)))) { LOG("【红】影片：解码器类型 %d 输出 %d 模式 %d 宿主不支持，各方法回失败", type, fmt, mode); return; }
-    if (!audio && type != MD_TYPE_VP9) LOG("【红】影片：解码器类型 %d（AVC / VP8）宿主不解码，出黑帧", type);
+    if (!audio && type == MD_TYPE_AVC && fmt != MD_FMT_NV12) { LOG("【红】影片：AVC 只出 NV12（要的输出 %d 模式 %d），各方法回失败", fmt, mode); return; }
+    if (!audio && type != MD_TYPE_VP9 && type != MD_TYPE_AVC) LOG("【红】影片：解码器类型 %d（VP8）宿主不解码，出黑帧", type);
     mdec_t *d = calloc(1, sizeof *d);
     pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_mutex_init(&d->wmu, NULL); pthread_cond_init(&d->wcv, NULL);
     d->type = type; d->fmt = fmt; d->mode = mode;
@@ -397,6 +425,12 @@ HLE_FORCE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", "影片解码器配置"
         MD_TRACE(d, 0, "Configure（Vorbis）：%d 声道 %d Hz，头 %d + %d 字节", ch, rate, d->vhdr_n[0], d->vhdr_n[1]);
         return 0;
     }
+    if (d->type == MD_TYPE_AVC && md) {   // SPS / PPS: csd-0 / csd-1 (Annex B, as Android's MediaCodec takes them) or, from this SDK's MP4 demuxer (Super Mario Odyssey), "avcc" = the avcC box
+        if (!d->avc) d->avc = mavc_new();
+        void *b = NULL;
+        for (int k = 0; k < 2; k++) { char key[8]; snprintf(key, sizeof key, "csd-%d", k); if (G.find_buf(md, key, &b) && b && G.data(b) && G.size(b)) mavc_param_sets(d->avc, G.data(b), G.size(b)); }
+        if (G.find_buf(md, "avcc", &b) && b && G.data(b) && G.size(b)) mavc_avcc(d->avc, G.data(b), G.size(b));
+    }
     int w = 0, h = 0; if (md) { G.find_i32(md, "width", &w); G.find_i32(md, "height", &h); }
     pthread_mutex_lock(&d->mu); if (w > 0 && h > 0 && !d->fmt_sent) { d->w = w; d->h = h; } pthread_mutex_unlock(&d->mu);
     MD_TRACE(d, 0, "Configure：MediaData 宽 %d 高 %d", w, h);
@@ -419,9 +453,10 @@ HLE_FORCE("_ZN5movie7Decoder5StartEv", "影片解码器开始：输入全空，�
 static void md_reset(mdec_t *d, int close) {
     pthread_mutex_lock(&d->dmu);   // wait for the packet being decoded
     if (close) md_job(d, MDJ_CLOSE);
+    if (d->avc) mavc_drop(d->avc);   // H.264 pictures waiting for their turn belong to the old position
     pthread_mutex_lock(&d->mu);
     for (int i = 0; i < MD_NIN; i++) d->infree[i] = i;
-    d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0;
+    d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0; d->avc_drain = 0;
     for (int i = 0; i < MD_NOUT; i++) d->out[i].used = d->out[i].pic = 0;
     pthread_mutex_unlock(&d->mu);
     pthread_mutex_unlock(&d->dmu);
@@ -463,7 +498,7 @@ HLE_FORCE("_ZN5movie7Decoder14GetInputBufferEiPNS_6BufferE", "影片解码器：
     G.set_data(buf, d->in[i], MD_INCAP); G.set_range(buf, 0, (int)MD_INCAP);
     return 0;
 }
-HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "影片解码器：送一包解码（VP9 用 libvpx）", int, h_movie_SendIn,
+HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "影片解码器：送一包解码（VP9 用 libvpx，AVC 用 VideoToolbox）", int, h_movie_SendIn,
           void **self, int i, int off, int size, int64_t pts, uint32_t flags) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
     if (i < 0 || i >= MD_NIN || off < 0 || size < 0 || (uint32_t)off + (uint32_t)size > MD_INCAP) return 0x100b;

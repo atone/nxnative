@@ -17,7 +17,7 @@ Everything here was learned on Diablo II: Resurrected (SDK ~12, NVN 53, the orig
 - **Bring your own files.** Keys, NSPs and anything extracted from them stay in the game's work folder (`$W` = `<NSP folder>/<title>-work`, next to the NSPs on the user's external drive; the home folder is nearly full), never in the repository, never in a commit, never printed. Print key *names* and lengths only.
 - **Measure, then change.** Each fix in this repository started from a concrete observation (a crash address and its decompilation, a census over all shaders, a memory profile). Write the evidence into the code comment next to the fix, the way the existing code does; the next title will need it.
 - **One repository, one profile per title.** nxnative (first called smbw-mobile) started as a copy of d2r-mobile's generic parts. Title- or SDK-specific constants live in the game profile `dm/games/<id>/` ([dm/games/README.md](../../dm/games/README.md)). That covers program ID, known builds, modules, address-space partition, NVN driver tables, the shader tables and the app identity. The code reads the profile through `game_profile.h` (host) or `dm/games/game.py` (tools). Behaviour that fits only one title's code is gated by that title's build ID (`dm_main_build()`), never left on for every title. Some things are still built into the translator: the texture / sampler handle bases and the depth mode (see [04](04-graphics.md)). `dmsh_build.py` refuses a profile whose bases differ from the translator's.
-- **Write code comments in English**, and keep the `【红】` prefix for red log lines that mark something unimplemented or wrong. The README's Chinese half is the only Chinese text.
+- **Write code comments in English**, and keep the `【红】` prefix for red log lines that mark something unimplemented or wrong.
 - **Test where it runs.** The Mac host (`dm/host/dmhost`) is the development loop; the iOS app reuses the same host and graphics code. Never claim something works on iOS without running it there.
 
 ## Checklist for a new title
@@ -27,7 +27,7 @@ Everything here was learned on Diablo II: Resurrected (SDK ~12, NVN 53, the orig
    - RomFS containers;
    - the rewrite-site census and imports vs. host hooks.
 
-   It extracts only the code modules plus a RomFS list.
+   It extracts only the code modules plus a RomFS list for the survey. Unless given `--survey-only`, it then writes a provisional profile into `<NSP folder>/<title ID>_build/profile/<title ID>/`, extracts the game and packs a best-effort IPA. That profile is the starting point for step 3: the values are guesses ([dm/games/README.md](../../dm/games/README.md)). For Mac runs, export `DM_GAMES_DIR=<NSP folder>/<title ID>_build/profile` until the profile moves into `dm/games/`.
 2. Extract base (and update, if in scope) — [01](01-extract.md). Finish the survey — [02](02-survey.md). Write down: SDK version, NVN API version, module list, imports the host lacks, SVCs, instruction census, NVN loader pattern, shader containers.
 3. Add a game profile `dm/games/<title ID>/game.tsv`, named after the base game's title ID (start from `010015100B514000/game.tsv`: identity, `build` rows, `modules`; keep the memory / NVN values until they are measured) and build the host for it with `make -C dm/host GAME=<id>`.
 4. Run the rewriter (`DM_RULESET=native`) and check its counts against `insn_census.py`.

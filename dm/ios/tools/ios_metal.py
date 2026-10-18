@@ -7,7 +7,9 @@ import subprocess
 # 缺省 fast 让各 GPU 的后端编译器可以把它们当成恒假；A20 Pro 上开场关卡的奇数帧主画面 NaN 72 万像素（M4 Pro 同一份 AIR 只有几十个），黑带 / 黑边光晕即由此而来
 # -fmetal-math-mode=relaxed: keep fast math's reassociation / contraction, but forbid assuming there are no NaN / Inf. The translated shaders reproduce Maxwell's NaN semantics with isnan selects (8337 / 12809 use them),
 # and the default fast mode lets each GPU's backend compiler treat them as always false; on the A20 Pro the opening course's odd frames had 727k NaN pixels in the main image (a few dozen with the same AIR on the M4 Pro), which became the black band / black-edged glow
-METAL = ['xcrun', '-sdk', 'iphoneos', 'metal', '-c', '-mios-version-min=18.0', '-fmetal-math-mode=relaxed']
+# -fpreserve-invariance：位置输出 [[invariant]] 只有加这个参数才保证跨着色器一致（同 dmsh_build.py 的 MAC_METAL：深度预通道 + 小于等于的 G-buffer）
+# -fpreserve-invariance: [[invariant]] position outputs only agree across shaders with this flag (as dmsh_build.py's MAC_METAL: a depth pre-pass followed by a less-or-equal G-buffer)
+METAL = ['xcrun', '-sdk', 'iphoneos', 'metal', '-c', '-mios-version-min=18.0', '-fmetal-math-mode=relaxed', '-fpreserve-invariance']
 METALLIB = ['xcrun', '-sdk', 'iphoneos', 'metallib']
 RECORD = ' '.join(METAL) + '; ' + ' '.join(METALLIB)                                # 写进 json chain.metal | Written into json chain.metal
 

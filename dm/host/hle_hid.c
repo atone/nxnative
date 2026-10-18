@@ -21,7 +21,7 @@ _Static_assert(sizeof(NpadState) == 0x28, "NpadState");
 
 // Front-end publishing: the keyboard / touch path (dm_input_set) and the physical controller path (dm_pad_set) are ORed; press edges are latched until the game's next read so short presses are not lost
 static _Atomic uint64_t g_btn, g_axes, g_latch, g_pad_btn, g_pad_axes, g_pad_latch;
-static _Atomic int64_t g_sampling;
+static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     return (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48;
 }
@@ -32,10 +32,10 @@ void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry
     uint64_t old = atomic_exchange(&g_pad_btn, buttons); atomic_fetch_or(&g_pad_latch, buttons & ~old); atomic_store(&g_pad_axes, pack(lx, ly, rx, ry));
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
-// DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown;
+// DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR (plus the sticks LLeft LUp LRight LDown and RLeft RUp RRight RDown) Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown;
 //   held 0.15 s by default, at most 1024 steps (counted after repeats are expanded). Goes through the controller path (dm_pad_set), ORed with keyboard / touch, neither overrides the other. Times are counted from host start.
 //   An f before the time means a presented frame number ("f7600:A", and the repeat interval counts frames too): when the machine is busy seconds drift from the game's progress, frame numbers do not (used for the Zelda BotW opening route)
-typedef struct { double at, hold; uint64_t btn; int32_t lx, ly; int frame; } key_step;
+typedef struct { double at, hold; uint64_t btn; int32_t lx, ly, rx, ry; int frame; } key_step;
 #define KEY_STEPS 1024
 static key_step g_steps[KEY_STEPS]; static int g_nsteps;
 static void *keys_main(void *arg) {
@@ -44,7 +44,7 @@ static void *keys_main(void *arg) {
         for (;;) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); double el = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
                    if (g_steps[i].frame ? (double)dm_guest_frame() >= g_steps[i].at : el >= g_steps[i].at) break; usleep(5000); }
         LOG("DM_KEYS：%s%.2f 按 %#llx（按住 %.2f s）", g_steps[i].frame ? "帧 " : "", g_steps[i].at, (unsigned long long)g_steps[i].btn, g_steps[i].hold);
-        dm_pad_set(g_steps[i].btn, g_steps[i].lx, g_steps[i].ly, 0, 0); usleep((useconds_t)(g_steps[i].hold * 1e6)); dm_pad_set(0, 0, 0, 0, 0);
+        dm_pad_set(g_steps[i].btn, g_steps[i].lx, g_steps[i].ly, g_steps[i].rx, g_steps[i].ry); usleep((useconds_t)(g_steps[i].hold * 1e6)); dm_pad_set(0, 0, 0, 0, 0);
     }
     return NULL;
 }
@@ -64,6 +64,9 @@ void hid_keys_init(void) {
             static const char *const sticks[4] = {"LLeft", "LUp", "LRight", "LDown"};
             static const int sx[4] = {-32767, 0, 32767, 0}, sy[4] = {0, 32767, 0, -32767};
             for (int d = 0; d < 4; d++) if (!strcasecmp(k, sticks[d])) { if (sx[d]) st.lx = sx[d]; if (sy[d]) st.ly = sy[d]; found = 1; }
+            // right stick the same way: RLeft RUp RRight RDown (camera; Super Mario Odyssey's first hint asks for it)
+            static const char *const rsticks[4] = {"RLeft", "RUp", "RRight", "RDown"};
+            for (int d = 0; d < 4; d++) if (!strcasecmp(k, rsticks[d])) { if (sx[d]) st.rx = sx[d]; if (sy[d]) st.ry = sy[d]; found = 1; }
             if (!found) LOG("【红】DM_KEYS 不认识的键名：%s", k);
             k = plus ? plus + 1 : NULL; }
         for (int i = 0; i < rep && g_nsteps < KEY_STEPS; i++) { g_steps[g_nsteps] = st; g_steps[g_nsteps++].at = st.at + i * every; }
@@ -96,8 +99,16 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     s->buttons = b;
     s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
 }
-// GetNpadStates(out, n, id): returns the number written, newest first. The host keeps no history: only 1 current state (callers handle the returned count)
-static int states(NpadState *out, int n, uint32_t id, uint32_t style) { if (n <= 0) return 0; fill(out, id, style); return 1; }
+// GetNpadStates(out, n, id): newest first, n entries: the current state repeated with consecutive sampling numbers. The host keeps no history, but on hardware the
+// 16-entry history is always full, and games read all of it whatever count comes back: Super Mario Odyssey (main+0x93fc20) polls every controller slot each frame, which advances
+// the shared sampling number by about 16 per frame, and with only entry 0 written neither stick did anything in play (the camera did not turn at its first hint) while buttons
+// and menus (the stick's direction bits) worked; with every entry written the camera turns
+static int states(NpadState *out, int n, uint32_t id, uint32_t style) {
+    if (n <= 0) return 0;
+    fill(out, id, style);
+    for (int i = 1; i < n; i++) { out[i] = out[0]; out[i].sampling = out[0].sampling - i; }
+    return n;
+}
 
 HLE_FORCE("_ZN2nn3hid14InitializeNpadEv", "连 hid 服务；宿主从前端状态取输入", void, h_hid_InitNpad, void) {}
 HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "支持的手柄号；宿主固定", void, h_hid_SetIds, const uint32_t *ids, uint64_t n) { (void)ids; (void)n; }
@@ -201,6 +212,10 @@ HLE_FORCE("_ZN2nn3hid23StartSevenSixAxisSensorEv", "机身六轴；宿主不提�
 HLE_FORCE("_ZN2nn3hid22StopSevenSixAxisSensorEv", "机身六轴", Result, h_hid_SevenStop, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3hid32ResetSevenSixAxisSensorTimestampEv", "机身六轴时间戳", void, h_hid_SevenReset, void) {}
 HLE_FORCE("_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi", "机身六轴状态：0 条", int, h_hid_SevenStates, void *out, int n) { (void)out; (void)n; return 0; }
+HLE_FORCE("_ZN2nn3hid26IsSevenSixAxisSensorAtRestEv", "机身六轴静止：是（超级马力欧 奥德赛）", unsigned, h_hid_SevenRest, void) { return 1; }
+// The development debug pad (Super Mario Odyssey initializes and polls it): never connected, all zero
+HLE_FORCE("_ZN2nn3hid18InitializeDebugPadEv", "调试手柄；宿主没有", void, h_hid_DbgPadInit, void) {}
+HLE_FORCE("_ZN2nn3hid16GetDebugPadStateEPNS0_13DebugPadStateE", "调试手柄状态：未连接（全 0）", void, h_hid_DbgPadState, void *st) { memset(st, 0, 32); }   // sampling number, attributes, buttons, two sticks
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "六轴融合；宿主忽略", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "六轴融合：未开", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "陀螺零漂模式：标准", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }

@@ -6,8 +6,8 @@
 #include <stddef.h>
 
 void mtl_init(void);
+void mtl_set_depth_zero(int on);          // NVN depth mode: 1 = near is 0 (D3D / Metal), 0 = near is -w (GL, NVN's default); picks the vertex shaders' entry point (see shader_load in nvn_mtl.m)
 void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (GL, NVN's default), 0 = upper left (D3D / Metal); see nvn_mtl.m
-void mtl_set_depth_near_zero(int on);     // NVN depth mode: 1 = near = 0 (D3D / Metal), 0 = near = -w (GL, NVN's default); see nvn_mtl.m
 void bf_want_note(const char *key);
 
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
@@ -39,5 +39,10 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU h
 void mtl_finish(void);                               // Wait for all submitted commands to complete
 void mtl_drain(void);                                // Wait for all commands on the queue (including presents) to complete: submit an empty command buffer and wait for it
 void mtl_xv_window_tex(uint64_t serial);   // Register a window (swapchain) texture: the cross-submit validity ledger never collects it
+// External producers (the Vulkan layer, dm/gfx/vk): the shared Metal device; a serial for one of their textures; present it once their event reaches ev_val (ticket for mtl_present_wait)
+void *mtl_device(void);
+uint64_t mtl_ext_tex(void *tex);
+uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val);
+void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
 void mtl_ui_ghost(int on, float px, float py, const float grid[4], float cx, float cy);   // Drag-follow image for shop items: when on=1, the icon of the item that covers screen point (px,py) and sits on the shop shelf grid `grid` (top-left x,y, width and height of one cell) is translated to center (cx,cy) and drawn once more at the end of the UI pass (normalized, top-left origin); callable from any thread
 int mtl_ui_ghost_rect(float r[4]);   // Screen rectangle (normalized) of the item recognized above; returns 0 if not recognized yet

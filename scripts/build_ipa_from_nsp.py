@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Unsigned IPA straight from the NSPs: identify the game (title ID → game profile dm/games/<id>/) → extract (nx_extract) → rewrite the code modules (patch_nso.py) → split out the shaders and check them against the profile's tables (shader_split.py)
-#   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A game with no matching profile is only surveyed (<NSP folder>/<title ID>_survey/survey.md); no IPA.
+#   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A game with no matching profile is surveyed (<NSP folder>/<title ID>_survey/survey.md), then gets a provisional profile guessed from
+#   the survey (<NSP folder>/<title ID>_build/profile/<title ID>/, outside the repository, found through DM_GAMES_DIR) and a best-effort IPA that may not boot; SURVEY_ONLY / --survey-only stops after the survey.
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
@@ -20,6 +21,8 @@ APP_NAME = ''                           # app name on the home screen (empty = t
 BUNDLE_ID = ''                          # the app's bundle ID (empty = org.nxnative.<base game title ID in lowercase>)
 KEEP_EXTRACTED = False                  # keep the extracted game files after the IPA is built (saves extraction next time; as big as the game files)
 DM_ENV_FILE = ''                        # optional: environment switches for a diagnostic build (one KEY=VALUE per line)
+SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
+PROFILE_OUT = ''                        # where a provisional profile goes (empty = <NSP folder>/<title ID>_build/profile; the profile is <this>/<title ID>/)
 
 BEAT = 60                               # progress interval of quiet steps (seconds)
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # GUI apps such as Spyder do not get the shell's PATH
@@ -198,6 +201,7 @@ def can_clone(d):   # whether this volume supports APFS clones (nx_extract uses 
 MAGICS = [(b'UnityFS\0', 'UnityFS'), (b'UnityWeb', 'UnityWeb'), (b'UnityRaw', 'UnityRaw'), (b'BNSH', 'BNSH'), (b'BAHS', 'BAHS'), (b'SARC', 'SARC'), (b'Yaz0', 'Yaz0'),
           (bytes.fromhex('28b52ffd'), 'zstd'), (b'FRES', 'bfres'), (b'BNTX', 'BNTX'), (b'BWAV', 'BWAV'), (b'FSAR', 'BFSAR'), (b'CPK ', 'CRI CPK'), (b'CRID', 'CRI USM'),
           (b'@UTF', 'CRI UTF'), (b'AKPK', 'Wwise pck'), (b'BKHD', 'Wwise bnk'), (b'FSB5', 'FMOD'), (b'\x89PNG', 'PNG'), (b'RIFF', 'RIFF'), (b'OggS', 'Ogg'), (b'PK\x03\x04', 'zip'), (b'NSO0', 'NSO')]
+PACKED = {'UnityFS', 'UnityWeb', 'Yaz0', 'zstd', 'BWAV', 'CRI CPK', 'CRI USM', 'Wwise pck', 'FMOD', 'PNG', 'Ogg', 'zip'}   # file headers of compressed / media formats (zip_store)
 MARKERS = [(b'nvnBootstrapLoader', 'NVN'), (b'vkCreateInstance', 'Vulkan'), (b'eglGetProcAddress', 'EGL / OpenGL'), (b'il2cpp_', 'Unity IL2CPP'), (b'UnityEngine', 'Unity'),
            (b'sead::', 'Nintendo sead'), (b'agl::', 'Nintendo agl'), (b'gsys::', 'Nintendo gsys'), (b'Unreal', 'Unreal'), (b'UE4', 'Unreal 4'), (b'Havok', 'Havok'), (b'CRIWARE', 'CRIWARE'), (b'Wwise', 'Wwise')]
 
@@ -215,7 +219,7 @@ def nso_image(path):   # decompress an NSO's three segments
 
 def survey(nsp_dir, app, fam, keys, repo, py, env):
     work = nsp_dir / f'{app:016X}_survey'; logs, ex = work / 'logs', work / 'extract'
-    say(f'没有 {app:016X} 的游戏档案：只做粗查，不出 IPA | no game profile for {app:016X}: survey only, no IPA')
+    say(f'没有 {app:016X} 的游戏档案：先粗查 | no game profile for {app:016X}: surveying first')
     nx = build_nx_extract(repo, work, logs, env)
     ups = sorted(fam['updates'], key=lambda u: u[0] or 0)
     upd = ups[-1][1] if ups else None
@@ -231,10 +235,10 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
 
     # Code modules
     R += ['', '## 代码模块 | Code modules', '', '| 模块 module | 构建号 build ID | text / ro / data (MB) |', '|---|---|---|']
-    found, sdkver, comps, unity, mods, glslc = {}, set(), set(), set(), [], 0
+    found, sdkver, comps, unity, mods, glslc, bids = {}, set(), set(), set(), [], 0, {}
     for p in sorted((ex / 'ExeFS').iterdir()):
         if p.read_bytes()[:4] != b'NSO0': continue
-        img, bid, szs = nso_image(p); mods.append(p)
+        img, bid, szs = nso_image(p); mods.append(p); bids[p.name] = bid
         R.append(f'| {p.name} | `{bid}` | ' + ' / '.join(f'{z / 2**20:.1f}' for z in szs) + ' |')
         sdkver |= {m.decode() for m in re.findall(rb'(?i)NintendoSDK_nnSdk-([0-9_]+)', img)}   # SDK 12 spells it NintendoSdk_, SDK 16 NintendoSDK_
         comps |= {m.decode() for m in re.findall(rb'SDK MW\+Nintendo\+([\w]+-[0-9_]+)', img)}
@@ -242,10 +246,12 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
         if p.name == 'main': glslc = img.count(b'\x91\x68\x86\x19')   # magic of GLSLC compiler outputs (shader_split.py glslc_shaders)
         for pat, name in MARKERS:
             if pat in img: found.setdefault(name, []).append(p.name)
-    npdm = ex / 'ExeFS/main.npdm'
+    npdm, program, sysres = ex / 'ExeFS/main.npdm', app, 0
     if npdm.exists():
         d = npdm.read_bytes(); a = d.find(b'ACI0')
-        if a >= 0: R.append(f'\n- main.npdm 程序号 | program ID: `{struct.unpack_from("<Q", d, a + 0x10)[0]:016X}`')
+        if d[:4] == b'META': sysres = struct.unpack_from('<I', d, 0x14)[0]   # system resource size: non-zero = virtual address memory (Engage, 16 MB)
+        if a >= 0: program = struct.unpack_from("<Q", d, a + 0x10)[0]; R.append(f'\n- main.npdm 程序号 | program ID: `{program:016X}`')
+        R.append(f'- 系统资源 | system resource: {sysres / 2**20:.0f} MB')
     R.append(f'- SDK: {", ".join(sorted(sdkver)) or "?"}（马力欧 | Mario: 16_2_0 / 16_2_12；D2R ≈ 12）')
     R.append('- SDK 组件 | SDK components: ' + (', '.join(sorted(comps)) or '—'))
     if unity: R.append('- Unity: ' + ', '.join(sorted(unity)))
@@ -254,7 +260,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
 
     # RomFS manifest
     tops, exts, mags, nfile, nbytes = collections.Counter(), collections.Counter(), collections.Counter(), 0, 0
-    topb, magb = collections.Counter(), collections.Counter()
+    topb, magb, extb, extc, dirs1, biggest = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter(), (0, '')
     for line in (ex / 'romfs_manifest.tsv').read_text(errors='replace').splitlines():
         if line.startswith('#'): continue
         path, size, head = line.split('\t'); size = int(size); h = bytes.fromhex(head)
@@ -262,9 +268,12 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
         parts = path.strip('/').split('/')
         top = '/'.join(parts[:2]) if len(parts) > 2 else parts[0] if len(parts) > 1 else '(根 | root)'   # two levels: Unity keeps everything under Data/
         tops[top] += 1; topb[top] += size
-        exts[os.path.splitext(path)[1].lower() or '(无 | none)'] += 1
+        exts[os.path.splitext(path)[1].lower() or '(无 | none)'] += 1; extb[os.path.splitext(path)[1].lower()] += size
+        if len(parts) > 1: dirs1[parts[0]] += 1
+        biggest = max(biggest, (size, path.strip('/')))
         mag = next((n for m, n in MAGICS if h.startswith(m)), None)
         if mag: mags[mag] += 1; magb[mag] += size
+        if mag in PACKED: extc[os.path.splitext(path)[1].lower()] += 1
     R += ['', f'## RomFS: {nfile} 个文件 | files, {nbytes / 2**30:.2f} GB', '', '| 顶层 top level | 文件 files | GB |', '|---|---|---|']
     R += [f'| {t} | {n} | {topb[t] / 2**30:.2f} |' for t, n in tops.most_common(20)]
     R += ['', '| 文件头 header magic | 文件 files | GB |', '|---|---|---|'] + [f'| {m} | {n} | {magb[m] / 2**30:.2f} |' for m, n in mags.most_common()]
@@ -298,6 +307,61 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     (work / 'survey.md').write_text('\n'.join(R) + '\n')
     for n in notes: say(n)
     say(f'粗查报告 | survey report: {work / "survey.md"}')
+    upv = ups[-1][0] if ups else None
+    return {'name': nacp.name(ex / 'control.nacp') or '', 'display': dv.group(1) if dv else '?', 'version': 'v0' if upd is None else f'v{upv or 1}', 'bids': bids,
+            'sdk': min((int(v) for v in major if v.isdigit()), default=0), 'sysres': sysres, 'program': program, 'glslc': glslc, 'mags': mags,
+            'dirs': [d for d, _ in dirs1.most_common()], 'marker': biggest[1], 'exts': {e: (exts[e or '(无 | none)'], b, extc[e]) for e, b in extb.items()}}
+
+
+# ---- Provisional profile (a game with no profile in dm/games) ----
+COMPRESSED = ('zstd', 'Yaz0', 'SARC', 'BNSH', 'BAHS', 'UnityFS')   # top-level containers that may hold shaders (then GLSLC outputs in main are not the game's shaders)
+
+
+def ipa_name(name, app):   # "The Legend of Zelda: Link's Awakening" → TheLegendOfZeldaLinksAwakening.ipa: ASCII words joined, apostrophes dropped; the title ID when nothing ASCII is left
+    words = re.findall(r'[A-Za-z0-9]+', name.replace("'", '').replace('’', ''))
+    words = [w.capitalize() if w.isupper() and len(w) > 1 else w[:1].upper() + w[1:] for w in words]
+    return (''.join(words)[:48] or f'{app:016X}') + '.ipa'
+
+
+def write_profile(pdir, app, f):
+    """A provisional game.tsv (+ the empty tables) from the survey, in pdir (outside the repository). An existing game.tsv is kept, so it can be edited by hand; delete it to regenerate.
+    Values follow the existing profiles: SDK 8 / 10 games (Link's Awakening, Super Mario 3D World) need the TTF shared font and NVN API 53.313, newer SDKs the defaults;
+    a game whose NPDM declares a system resource uses virtual address memory and gets Engage's partition (large alias region), the others the 4 GB partition of Breath of the Wild / 13 Sentinels"""
+    pdir.mkdir(parents=True, exist_ok=True)
+    if (pdir / 'game.tsv').exists():
+        say(f'沿用临时游戏档案 | reusing the provisional profile: {pdir / "game.tsv"}（删掉它会按粗查重写 | delete it to regenerate from the survey）')
+        return
+    def order(m): return (m != 'main', m == 'sdk', int(m[6:]) if m.startswith('subsdk') and m[6:].isdigit() else 0)
+    mods = sorted((m for m in f['bids'] if m != 'rtld'), key=order)
+    groups, seen = [], {'main', 'other'}
+    for d in f['dirs'][:24]:   # shader package groups by RomFS top-level folder (this only names the package files; anything else goes to "other")
+        g = re.sub(r'[^a-z0-9]', '', d.lower())[:16] or 'g'
+        while g in seen: g += 'x'
+        seen.add(g); groups.append(f'/{d}/={g}')
+    glslc = f['glslc'] > 0 and not any(f['mags'][m] for m in COMPRESSED)   # shaders compiled into main (13 Sentinels: no shader containers in the RomFS)
+    # stored in the IPA uncompressed: file types that are mostly compressed already (Yaz0 / zstd / zip / media headers; Super Mario Odyssey's 3.8 GB of .szs took the zip 1 h 40 min to deflate again)
+    # and big files (mostly compressed formats without a known header)
+    store = sorted(e for e, (n, b, c) in f['exts'].items() if e and n and (b / n >= 1 << 20 or 2 * c >= n))
+    name = f['name'] or f'{app:016X}'
+    T = '\t'
+    L = ['# 临时游戏档案（scripts/build_ipa_from_nsp.py 按粗查生成，没有人工核对）| Provisional game profile (generated by scripts/build_ipa_from_nsp.py from the survey, not checked by hand)',
+         f'# {name}, SDK {f["sdk"] or "?"}, survey {f["survey"]}', '',
+         '# ---- Identity ----', f'title_id{T}{app:016X}', f'program_id{T}{f["program"]:016X}', '',
+         '# ---- App ----', f'name{T}{name}', f'ipa{T}{ipa_name(name, app)}', f'app_category{T}public.app-category.games', f'pad_layout{T}simple', '',
+         '# ---- Versions ----', T.join(['build', f['version'], f['display']] + [f'{m}={f["bids"][m]}' for m in mods]), f'package{T}{f["version"]}', f'shader_versions{T}{f["version"]}', '',
+         '# ---- Files ----', f'modules{T}{" ".join(mods)}', f'romfs_marker{T}{f["marker"]}', f'zip_store{T}{":".join(store + [".metallib"])}', '']
+    if 0 < f['sdk'] <= 10: L += ['# SDK 8 / 10: the shared-font address points at the TTF itself, and the game wants NVN API 53', f'shared_font{T}ttf', f'device_api{T}53.313', '']
+    if f['sysres'] > 0: L += ['# ---- Memory: the NPDM declares a system resource (virtual address memory), Engage\'s partition ----', f'mem_reserve{T}0x140000000', f'mem_alias{T}0x118000000', f'mem_stack{T}0x10000000', f'app_pool{T}0xA0000000', '']
+    else: L += ['# ---- Memory ----', f'mem_reserve{T}0x100000000', f'mem_alias{T}0x10000000', f'mem_stack{T}0x10000000', f'app_pool{T}0xCD500000', '']
+    L += ['# ---- NVN driver constant segments (Mario\'s values, the translator\'s built-in layout) ----', f'nvn_tex_base{T}0x20', f'nvn_tex_slots{T}32', f'nvn_samp_base{T}0x568', f'nvn_img_base{T}0x120', f'nvn_img_slots{T}8',
+          f'nvn_ssbo_bases{T}vs=0x110 ps=0x510 cs=0x310', '', '# ---- Shader split ----', f'shader_groups{T}{" ".join(groups) or "/=romfs"}', f'shader_note{T}{name} shaders (provisional profile)']
+    if glslc: L += [f'shader_main_glslc{T}on', f'shader_separable{T}on']
+    (pdir / 'game.tsv').write_text('\n'.join(L) + '\n', encoding='utf-8')
+    (pdir / 'shader_map.tsv.conflicts.tsv').write_text(f'# kind: evidence  控制段键冲突裁定：表空 | control-section key conflict rulings: empty\ndm_ctl_sha16{T}chosen_pc{T}class{T}candidates{T}records\n')
+    (pdir / 'bf_want.tsv').write_text('# generated\n')
+    (pdir / 'pso_manifest.tsv').write_text('# Prewarm seed list (shipped in the app, next to shader_map.tsv). Rows: S<TAB>shader key<TAB>stage / R<TAB>render pipeline key (pso_skey hex) / C<TAB>compute shader key.\n'
+                                           '# Provisional profile: empty until recorded on the Mac (DM_PSO_MANIFEST=off DM_PSO_RECORD).\n')
+    say(f'写了临时游戏档案 | wrote a provisional game profile: {pdir / "game.tsv"}')
 
 
 # ---- Steps ----
@@ -365,22 +429,27 @@ def data_rows(b):   # a table's data rows (without # comment lines: the header c
     return [l for l in b.splitlines() if not l.startswith(b'#')]
 
 
-def split_shaders(py, repo, roms, mains, pkg, env, logs, g):
+def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False):
     tmp = pkg.with_name(pkg.name + '.partial'); rmtree(tmp); (tmp / 'tables').mkdir(parents=True)
     say('拆出着色器 | splitting out the shaders')
     names = ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv')
     run([py, repo / 'dm/gfx/tools/shader_split.py', ','.join(map(str, roms)), ','.join(map(str, mains)), tmp / 'pkg'] + [tmp / 'tables' / n for n in names], logs / 'shader_split.log', env=env)
+    if provisional:   # a provisional profile takes the tables as they come
+        for n in names: shutil.copyfile(tmp / 'tables' / n, g.table(n))
+        swap_in(tmp / 'pkg', pkg); rmtree(tmp); return
     # Data rows byte-identical to the profile's = the same game files the tables were built from; if not, stop (the profile's tables are left alone). Only data rows are compared: the header of Engage's profile tables was written by an older shader_split
     diff = [n for n in names if data_rows((tmp / 'tables' / n).read_bytes()) != data_rows(g.table(n).read_bytes())]
     if diff: raise BuildError(f'拆出的着色器表与游戏档案 {g.id} 的不同 | the split shader tables differ from game profile {g.id}\'s: {", ".join(diff)}（游戏文件不是档案登记的版本？| game files not the versions the profile registers?）')
     swap_in(tmp / 'pkg', pkg); rmtree(tmp)
 
 
-def build_shaders(py, repo, sh, xlate, env, logs, g):
+def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False):
     say('出 iOS 着色器库（马力欧首次约 30 分钟，之后走缓存约 7 分钟）| building the iOS shader libraries (Mario: about 30 minutes the first time, about 7 with the cache)')
     ios = sh / 'ios'
+    if provisional: run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--header'], logs / 'dmsh_chain.log', env=env)   # the profile's chain version header (dmsh_build checks it)
     run([py, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], logs / 'dmsh_build.log', env=dict(env, XLATE=str(xlate), IOSOUT=str(ios)), quiet=True)
     chain = re.search(r'#define DMSH_CHAIN "(.*)"', g.table('dmsh_chain.h').read_text()).group(1)
+    if provisional: run([py, repo / 'dm/gfx/tools/c1_guard.py', sh / 'cache' / f'b-{chain}', g.table('c1_full.tsv')], logs / 'c1_guard.log', env=env)   # shaders whose c1 reads are not proven bounded
     libs = ios / f'b-{chain}'
     n = sum(1 for _ in libs.glob('*_b.metallib')) if libs.is_dir() else 0
     if n == 0: raise BuildError(f'没出 iOS 着色器库 | no iOS shader libraries in {libs}')
@@ -398,7 +467,7 @@ def parse_args(argv):
     """Command-line options: when given they override "Settings"; F5 in Spyder passes none, so "Settings" is used as is. -h shows the help"""
     import argparse
     ap = argparse.ArgumentParser(prog='build_ipa_from_nsp.py',
-        description='从 NSP 出未签名 IPA；没有游戏档案的游戏只写粗查报告 | Build an unsigned IPA from a game\'s NSPs; a game with no profile only gets a survey.',
+        description='从 NSP 出未签名 IPA；没有游戏档案的游戏先粗查，再按临时档案尽力出包 | Build an unsigned IPA from a game\'s NSPs; a game with no profile is surveyed and gets a best-effort IPA from a provisional profile.',
         epilog='例 | example: python3 scripts/build_ipa_from_nsp.py ~/nsp/"Super Mario Bros Wonder" -k ~/keys/prod.keys')
     ap.add_argument('nsp_dir', nargs='?', help='放一个游戏 NSP 的文件夹（缺省 = 设置 NSP_DIR，再没有就问）| folder holding one game\'s NSPs (default: the NSP_DIR setting, else asked)')
     ap.add_argument('-k', '--keys', help='prod.keys 的路径（缺省 = 设置 PROD_KEYS，再没有就问）| path of prod.keys (default: the PROD_KEYS setting, else asked)')
@@ -408,6 +477,8 @@ def parse_args(argv):
     ap.add_argument('--bundle-id', help='App 的包名（缺省 = org.nxnative.<基础版标题号小写>）| the app\'s bundle ID (default: org.nxnative.<base game title ID in lowercase>)')
     ap.add_argument('--keep-extracted', action='store_true', help='出包后保留解出的游戏文件 | keep the extracted game files after the IPA is built')
     ap.add_argument('--env-file', help='诊断包的环境开关文件（每行 KEY=VALUE）| environment switches for a diagnostic build (one KEY=VALUE per line)')
+    ap.add_argument('--survey-only', action='store_true', help='没有游戏档案的游戏只写粗查报告，不生成临时档案、不出 IPA | a game with no profile: only the survey, no provisional profile and no IPA')
+    ap.add_argument('--profile-out', help='临时游戏档案放哪（缺省 = <NSP 文件夹>/<标题号>_build/profile）| where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     return ap.parse_args(argv)
 
 
@@ -431,13 +502,24 @@ def main(args=None):
     try: app, fam = scan_nsps(nsp_dir, lister)
     finally:
         if lister_dir: rmtree(lister_dir)
-    g = gamemod.by_title(app)
-    if g is None:   # no game profile: survey only
+    g, provisional = gamemod.by_title(app), False
+    if g is None:   # no game profile: survey, then (unless --survey-only) a provisional profile outside the repository and a best-effort IPA
         missing = [m for m in ('lz4.block', 'capstone') if not _importable(m)]
         if missing: raise BuildError(f'当前 Python（{sys.executable}）缺模块 | the current Python is missing modules: {", ".join(missing)}')
         if not shutil.which('dotnet', path=env['PATH']): raise BuildError('找不到 dotnet（.NET SDK 10）| dotnet not found (.NET SDK 10)')
-        return survey(nsp_dir, app, fam, keys, repo, py, env)
-    say(f'游戏档案 | game profile: {g.id}')
+        pdir = Path(os.path.expanduser(args.profile_out or PROFILE_OUT)).resolve() if (args.profile_out or PROFILE_OUT) else nsp_dir / f'{app:016X}_build' / 'profile'
+        if (pdir / f'{app:016X}' / 'game.tsv').exists() and not (args.survey_only or SURVEY_ONLY):
+            say(f'没有 {app:016X} 的游戏档案，沿用上次生成的临时档案（删掉它会重新粗查）| no game profile for {app:016X}: reusing the provisional profile from the last run (delete it to survey again)')
+        else:
+            facts = survey(nsp_dir, app, fam, keys, repo, py, env)
+            if args.survey_only or SURVEY_ONLY: return
+            facts['survey'] = str(nsp_dir / f'{app:016X}_survey' / 'survey.md')
+            write_profile(pdir / f'{app:016X}', app, facts)
+        # the profile folder joins the search path of game.py, which the shader tools, make and build_ipa.sh all use (DM_GAMES_DIR)
+        os.environ['DM_GAMES_DIR'] = env['DM_GAMES_DIR'] = os.pathsep.join([str(pdir)] + [d for d in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if d and d != str(pdir)])
+        g, provisional = gamemod.load(f'{app:016X}'), True
+        say('【红】临时游戏档案：按粗查猜的值，游戏可能起不来；出包后按 docs/agents 起机 | provisional game profile: values guessed from the survey, the game may not boot; bring it up per docs/agents after packing')
+    say(f'游戏档案 | game profile: {g.id}{"（临时 | provisional: " + str(g.dir) + "）" if provisional else ""}')
     builds, need = g.builds(), g.words('shader_versions')
     pkg_ver = args.package or PACKAGE or g.get('package')
     if pkg_ver not in builds: raise BuildError(f"打进 IPA 的版本（-p / PACKAGE）只能是游戏档案登记的 | the version to pack (-p / PACKAGE) must be one the game profile registers: {', '.join(builds)}")
@@ -470,17 +552,20 @@ def main(args=None):
     app_name = args.app_name or APP_NAME or nacp.name(base / 'control.nacp')
     if not app_name: raise BuildError(f'基础版解包里读不出游戏名（{base / "control.nacp"}；旧的解包没存它：删掉 extract/ 重跑，或用 --app-name 指定）| no game name in the base extraction ({base / "control.nacp"}; an older extraction did not save it: delete extract/ and run again, or give --app-name)')
     bundle_id = args.bundle_id or BUNDLE_ID or f'org.nxnative.{app:016x}'
-    say(f'App 名 | app name: {app_name}；包名 | bundle ID: {bundle_id}')
+    # the app version is the packed game's display version: the update's control data when an update is packed (nx_extract saves it next to the RomFS), else the base game's
+    app_version = nacp.version(game / 'control.nacp') or nacp.version(base / 'control.nacp')
+    say(f'App 名 | app name: {app_name}；版本 | version: {app_version or "1.0"}；包名 | bundle ID: {bundle_id}')
 
     patched = work / f'patched_{pkg_ver}'
     rewrite(py, repo, game / 'ExeFS', patched, env, logs, g)
     sh = work / 'shader'
-    split_shaders(py, repo, [dirs[v] / 'RomFS' for v in need], [dirs[v] / 'ExeFS/main' for v in need], sh / 'pkg', env, logs, g)
-    ios = build_shaders(py, repo, sh, xlate, env, logs, g)
+    split_shaders(py, repo, [dirs[v] / 'RomFS' for v in need], [dirs[v] / 'ExeFS/main' for v in need], sh / 'pkg', env, logs, g, provisional)
+    ios = build_shaders(py, repo, sh, xlate, env, logs, g, provisional)
 
     if free_gb(out_ipa.parent) < 5: raise BuildError(f'{out_ipa.parent} 所在的卷剩余不足 5 GB | less than 5 GB free on the volume of {out_ipa.parent}')
     say(f'出 IPA | building the IPA → {out_ipa}')
     ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''))
+    if app_version: ipa_env['DM_APP_VERSION'] = app_version
     # app icon: the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)
     if icon: ipa_env['DM_ICON'] = str(icon); say(f'App 图标 | app icon: {icon}')
@@ -493,6 +578,9 @@ def main(args=None):
     if not (args.keep_extracted or KEEP_EXTRACTED):
         say(f'删掉解出的游戏文件 | deleting the extracted game files: {ex}'); rmtree(ex)
     say(f'完成 | done: {out_ipa}（{out_ipa.stat().st_size / 2**30:.1f} GB）')
+    if provisional:
+        say(f'【红】这是按临时游戏档案出的包，游戏可能起不来 | this IPA was built from a provisional game profile and the game may not boot: {g.dir}')
+        say(f'  Mac 上起机：DM_GAMES_DIR="{g.dir.parent}" make -C dm/host GAME={g.id} dmhost，见 docs/agents | bring-up on the Mac: DM_GAMES_DIR="{g.dir.parent}" make -C dm/host GAME={g.id} dmhost, see docs/agents')
 
 
 def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted

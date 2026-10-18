@@ -40,7 +40,12 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
-MAC_RECORD = 'xcrun -sdk macosx metal -c; xcrun -sdk macosx metallib'
+# -fpreserve-invariance：顶点着色器的位置标了 [[invariant]]，但不加这个参数 Metal 不保证两个不同的着色器把同一算式算成同一个值；Maxwell 上同一套乘加必然一样。
+# 超级马力欧 奥德赛先用 alRenderDepthOnly 画深度预通道，再用另一个顶点着色器按「小于等于」画 G-buffer：差一点就深度测试失败，那些像素留着旧画面（帽子王国地面一块块 32x32）
+# -fpreserve-invariance: vertex positions are marked [[invariant]], but without this flag Metal does not promise that two different shaders compute the same expression to the same value; on Maxwell the same multiply-adds always agree.
+# Super Mario Odyssey draws a depth pre-pass with alRenderDepthOnly, then the G-buffer with another vertex shader and depth test less-or-equal: a hair off and the test failed, leaving those pixels with old content (Cap Kingdom's ground in 32x32 blocks)
+MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fpreserve-invariance']
+MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # 贴图句柄表（贴图指令立即数句柄所在的驱动段）：马力欧（NVN 55）是 0x20 + 8 r、32 槽——全库 4888 个着色器的立即数句柄恰是 0x20..0xF0、步长 8（D2R 的旧驱动是 0x168）。
 #   本作只用合并句柄（nvnCommandBufferBindTexture），没有分离采样器；图像句柄表仍在 0x120 + 8 r（8 槽，紧接贴图表之后；agl 的 10 个计算着色器实测 0x120 / 0x128 / 0x130，与 D2R 同址）。
 # Texture handle table (the driver segment holding texture instructions' immediate handles): Mario (NVN 55) uses 0x20 + 8 r, 32 slots - the immediate handles of all 4888 shaders are exactly 0x20..0xF0 in steps of 8 (D2R's older driver used 0x168).
@@ -211,7 +216,7 @@ def fetch_finish(key, src, refl):
                 open(fmsl, 'w').write(fv)
                 fair = fmsl[:-6] + '.air'; flib = os.path.join(out, key + '_bf.metallib')
                 try:
-                    subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', fmsl, '-o', fair], check=True)
+                    subprocess.run([*MAC_METAL, fmsl, '-o', fair], check=True)
                     tmp_flib = flib + '.tmp-' + str(os.getpid())
                     subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', tmp_flib], check=True)
                     os.replace(tmp_flib, flib)
@@ -480,20 +485,35 @@ def vs_pad(key, src):
     k = src.find('main0_out out = {};') + len('main0_out out = {};')
     return src[:k] + ''.join(f'\n    out.dm_pad{l} = float4(0.0, 0.0, 0.0, 1.0);' for l in miss) + src[k:], miss
 
-def vs_defaults(src):
-    """顶点着色器的每个 4 分量输出先置 (0,0,0,1)，之后实际写到的分量照常覆盖。
-    Maxwell 上顶点没写的输出分量读到的是缺省值 (0,0,0,1)；MSL 的 main0_out out = {} 全置 0。织梦岛的场景顶点着色器只写世界坐标的 xyz，像素着色器拿 w 当齐次坐标去除：
-    w = 0 让阴影坐标成了无穷大，村子大片落在「阴影」里（整份画面像阴天）。vs_pad 只补整个没写的位置，这里补写了一部分的。
-    Every 4-component output of a vertex shader starts as (0,0,0,1); the components actually written overwrite it as before.
-    On Maxwell a pixel shader reading an output component the vertex shader did not write gets the default (0,0,0,1); MSL's main0_out out = {} zeroes everything. Link's Awakening's scene vertex shaders
-    write only xyz of the world position and the pixel shader divides by w: w = 0 sent the shadow coordinates to infinity and put most of the village "in shadow" (the whole picture looked overcast).
-    vs_pad covers locations not written at all; this covers the partly written ones."""
+def vs_init(src):
+    """顶点着色器的每个输出先置 (0,0,0,1)，再跑翻译出的主体：硬件上没写的分量就是这个缺省值。翻译器出的源码以 out = {} 开头，全是 0；
+    Ryujinx 连接阶段时把下一阶段读的分量这样初始化，这里逐个着色器离线翻译，不知道下一阶段读什么，就全初始化（写了的分量照样被主体覆盖）。
+    只写 xyz 的输出（世界坐标）在像素着色器里按 w 除：w 为 0 时整张阴影图的比较值成了无穷大，梦见岛户外全在阴影里（暗、篱笆不投影）。
+    Every vertex shader output starts as (0,0,0,1) before the translated body runs: on the hardware that is what an unwritten component reads. The translator's source starts with out = {}, all zeros;
+    Ryujinx initializes the components the next stage reads this way when it links stages, and since every shader is translated offline on its own without knowing what the next stage reads, all are
+    initialized (components the body writes are overwritten as before). An output written only in xyz (a world position) is divided by its w in the pixel shader: with w = 0 every shadow-map
+    compare value became infinite and Link's Awakening was in shadow everywhere outdoors (dim, no shadows from the fences)."""
     i = src.find('struct main0_out\n{\n'); j = src.find('\n};', i); k = src.find('main0_out out = {};')
     if i < 0 or j < 0 or k < 0: return src
-    outs = re.findall(r'\n\s*(float4|int4|uint4) (\w+) \[\[user\(locn\d+\)\]\]', src[i:j])
-    if not outs: return src
+    outs = re.findall(r'\n    float4 (\w+) \[\[user\(locn\d+\)\]\];', src[i:j])
     k += len('main0_out out = {};')
-    return src[:k] + ''.join(f'\n    out.{n}.w = 1.0;' if t == 'float4' else f'\n    out.{n}.w = as_type<{t[:-1]}>(1.0f);' for t, n in outs) + src[k:]
+    return src[:k] + ''.join(f'\n    out.{n} = float4(0.0, 0.0, 0.0, 1.0);' for n in outs) + src[k:]
+
+def vs_depth(src):
+    """深度口径的两个入口：翻译器出的顶点着色器 z 原样（NVN 近=0 口径）；这里把主函数复制一份——main0 在每个 return out 前补 GL 口径（近=-w）的 z' = z/2 + w/2
+    （与 Ryujinx 原先在翻译器里改写的算式逐位相同），main0_z 不改。游戏设的口径是运行时状态（nvnDeviceSetDepthMode），宿主按它挑入口，任何游戏都不用配。
+    Metal 的函数常量也能做，但带函数常量的函数一律要特化才能建管线（实测每个顶点着色器约 2.4 ms），两个入口只多编一份顶点着色器（库里约 30%）。
+    返回 (只含 main0 的源码：反射 / 栅格事实照旧按它算, 写进 metallib 的完整源码)。
+    Two entry points for the depth convention: the translator's vertex shader leaves z unchanged (NVN's near=0 convention); the main function is copied here - main0 gets the GL convention's (near=-w) z' = z/2 + w/2 before every return out
+    (bit-identical to the formula Ryujinx used to emit in the translator), main0_z stays as is. The convention a game sets is runtime state (nvnDeviceSetDepthMode); the host picks the entry point by it, with nothing to configure per game.
+    Metal function constants could do this too, but a function with function constants must always be specialized before a pipeline can be built (measured about 2.4 ms per vertex shader); two entry points only compile the vertex shaders twice (about 30% of the library).
+    Returns (the source with only main0: reflection / raster facts are computed from it as before, the full source written into the metallib)."""
+    m = re.search(r'\bvertex\s+main0_out\s+main0\s*\(', src)
+    if not m: sys.exit('【红】顶点着色器没有 main0 主函数，补不了深度入口 | vertex shader without a main0 main function, cannot add the depth entry points')
+    body = src[m.start():]   # 主函数是文件里最后一个函数 | the main function is the last function in the file
+    gl = body.replace('return out;', 'out.gl_Position.z = fma(out.gl_Position.z, 0.5, out.gl_Position.w * 0.5);\n    return out;')
+    single = src[:m.start()] + gl
+    return single, single + '\n' + re.sub(r'\bmain0\s*\(', 'main0_z(', body, count=1)
 
 def finish(key, w, j, c1):
     name, k = loc[key]
@@ -512,15 +532,20 @@ def finish(key, w, j, c1):
             if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
             src = open(msl).read()
     pad = []
+    if j['stage'] == 'vs':   # 输出先置 (0,0,0,1)（见 vs_init） | outputs start as (0,0,0,1) (see vs_init)
+        src = vs_init(src); open(msl, 'w').write(src)
+        if src_f: src_f = vs_init(src_f)
     if j['stage'] == 'vs' and PAIRS.get(key):   # 像素着色器读而顶点没写的输出补成 (0,0,0,1)（见 vs_pad） | outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
         src, pad = vs_pad(key, src)
         if src_f: src_f, _ = vs_pad(key, src_f)
-    if j['stage'] == 'vs':
-        src = vs_defaults(src); open(msl, 'w').write(src)
-        if src_f: src_f = vs_defaults(src_f)
+        if pad: open(msl, 'w').write(src)
+    if j['stage'] == 'vs':   # 两个深度口径入口（见 vs_depth）；之后的分析都按只含 main0 的源码 | the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
+        src, full = vs_depth(src)
+        open(msl, 'w').write(full)
+        if src_f: _, src_f = vs_depth(src_f)   # 浮点变体也带两个入口 | the float variant gets both entry points too
     res = json.load(open(os.path.join(w, key + '.res.json')))
     try:
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
+        subprocess.run([*MAC_METAL, msl, '-o', air], check=True)
         tmp_lib = lib + '.tmp-' + str(os.getpid())
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', tmp_lib], check=True)
         os.replace(tmp_lib, lib)
@@ -536,7 +561,7 @@ def finish(key, w, j, c1):
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
-            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None,
+            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z'} if j['stage'] == 'vs' else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['无配对 PC 反射，查询按缺省'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
@@ -559,7 +584,7 @@ def float_variant(key, w, src_f, refl, extra):
     msl = os.path.join(w, key + '_bv.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_bv.metallib')
     open(msl, 'w').write(src_f)
     try:
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
+        subprocess.run([*MAC_METAL, msl, '-o', air], check=True)
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', lib + '.tmp'], check=True); os.replace(lib + '.tmp', lib)
     except subprocess.CalledProcessError as e: return '浮点变体 metal 失败', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_bv.metal'))

@@ -42,7 +42,7 @@ What the script does:
 5. It builds the iOS shader libraries.
 6. It calls `build_ipa.sh`.
 
-Everything it writes stays in the NSP folder: intermediate files and logs in `<id>_build/`, the IPA next to the NSPs. The extracted game files are deleted at the end unless you pass `--keep-extracted`. It exits with 0 when done and 1 on an error. The app's bundle ID is `org.nxnative.<base game title ID>` (for example `org.nxnative.0100a6301214e000`); `--app-name` / `--bundle-id` (or `APP_NAME` / `BUNDLE_ID` in Spyder) override the name and ID.
+Everything it writes stays in the NSP folder: intermediate files and logs in `<id>_build/`, the IPA next to the NSPs. The extracted game files are deleted at the end unless you pass `--keep-extracted`. It exits with 0 when done and 1 on an error. The app's bundle ID is `org.nxnative.<base game title ID>` (for example `org.nxnative.0100a6301214e000`), and its version is the game's display version: the update's when an update is packed, else the base game's (Engage 2.0.0); `--app-name` / `--bundle-id` (or `APP_NAME` / `BUNDLE_ID` in Spyder) override the name and ID.
 
 On the device, environment switches go in `Documents/env.txt` (one `KEY=VALUE` per line), and game files are also accepted at `Documents/romfs`.
 
@@ -56,7 +56,7 @@ Each game has a profile in `dm/games/<id>/`:
 The shader tools pick a profile with `DM_GAME=<id>`; `make -C dm/host` and `build_ipa.sh` pick it with `GAME=<id>`. Profiles are named after the base game's title ID. There is no default game: without `GAME` / `DM_GAME` the tools stop and list the profiles. `python3 dm/games/game.py list` lists the profiles. Host code that relies on one build's fixed addresses checks that build's ID.
 
 To add a game:
-1. Run `scripts/build_ipa_from_nsp.py` on its NSP folder. With no matching profile, it writes a survey to `<title ID>_survey/survey.md`. The survey covers the modules, SDK, engine, containers, rewrite sites, and the imports compared with the host's hooks.
+1. Run `scripts/build_ipa_from_nsp.py` on its NSP folder. With no matching profile, it writes a survey to `<title ID>_survey/survey.md`. The survey covers the modules, SDK, engine, containers, rewrite sites, and the imports compared with the host's hooks. It then guesses a provisional profile from the survey into `<title ID>_build/profile/<title ID>/` (outside the repository; tools find it through `DM_GAMES_DIR`), generates its shader tables and chain header, and packs a best-effort IPA that may not boot. `--survey-only` stops after the survey, and `--profile-out` puts the profile elsewhere. Details in [dm/games/README.md](../dm/games/README.md).
 2. Add a profile as described in [dm/games/README.md](../dm/games/README.md).
 3. Bring the game up following [docs/agents](agents/README.md): extraction, binary survey, a catalogue of host bring-up failures, graphics, and debugging recipes.
 
@@ -137,11 +137,32 @@ Record on the game version you ship. At launch the log names each list it read a
 **The Legend of Zelda: Link's Awakening (`01006BB00C6F0000`)**
 - **Engine:** Grezzo's engine on NintendoWare, SDK 8.2.0 (the oldest so far), NVN 53. Modules main + subsdk0 (GLSLC, NVN's runtime shader compiler) + subsdk1 (movie) + sdk; 9,698 shaders from the bfsha archives, effects and layouts.
 - **Window origin:** the only game so far that keeps NVN's default lower-left (OpenGL) window origin; the host flips its viewports and winding and the window image at present ([04](agents/04-graphics.md)). Before that, text the game renders into textures came out upside down.
-- **Vertex shaders:** the scene shaders leave the w of their world-position output unwritten (Maxwell reads (0, 0, 0, 1)), and some prepass shaders take the same input as integers in one draw and as Half / normalized data in another; the build handles both (`vs_defaults`, the `<key>_bv` float variants, [04](agents/04-graphics.md)). Before that, a huge shadow covered the village and the trees had no canopies.
-- **Depth mode:** the only game so far in NVN's near = 0 depth mode; the host maps the translator's GL-style depth back with the viewport depth range ([04](agents/04-graphics.md)). Before that, the tilt-shift depth of field blurred the whole picture outdoors.
+- **Vertex inputs:** some prepass shaders take the same input as integers in one draw and as Half / normalized data in another, or both in one draw; the build keeps a float-declared variant `<key>_bv` and the host picks or mixes by the bound formats ([04](agents/04-graphics.md)). Before that, trees had no canopies.
 - **Movies:** VP9 with a 5.1 Vorbis sound track; the host decodes the sound with stb_vorbis.
+- **Lighting:** tiled forward lighting whose tile lists a compute shader builds each frame; it needs the dispatch size in NVN's driver segment `c0` ([04](agents/04-graphics.md)). Before the host supplied it, lights piled into the bottom tile row and the doorway step flickered with white tiles.
+- **Sound:** SDK 8 numbers the audio renderer's commands differently (the output command is 0x10, not 0x13); the host recognises the output command by its size. Before that, music and sound effects were silent and only the movies had sound ([03](agents/03-bringup.md)).
 - **Mac input:** the title wants L+R: `DM_KEYS="f6000:L+R~0.4,f6300:A,f6500:A,f6700:Down,f6800:A"` reaches a new file's name entry (a fresh save directory via `SV=`).
 - **Frame rate:** gameplay runs at 60 like on the Switch; the game itself drops to 30 (present interval 2) for event cutscenes.
+- **Depth of field:** outdoors the game blurs the top and bottom of the screen by depth. It sets NVN's near = 0 depth mode, which the shader translation now follows for every game (an entry point per mode, picked at run time); before that the whole screen was blurred ([04](agents/04-graphics.md)).
+- **Sunlight:** outdoors the sun's shadow test failed everywhere, so the scene was dim and nothing cast a shadow. The world position its shaders pass between stages has no w written, and the translation filled it with 0 instead of the hardware's 1; every game's shaders now get the hardware's default ([04](agents/04-graphics.md)).
+- **Physics:** at 30 fps the game steps physics twice per frame. Its completion task destroys itself after it runs, and on Apple devices that destructor could land after the next step had already rebuilt the task, so the physics workers crashed when a conversation or cutscene began. A per-build cut drops the destructor call ([03](agents/03-bringup.md)).
+
+**Super Mario Odyssey (`0100000000010000`), being ported**
+- **Engine:** Nintendo EPD's sead / agl with NintendoWare, SDK 7.3.2 (the oldest so far), update 1.4.1. Modules main + subsdk0 (movie) + sdk; 27,984 shaders (agl `sharcb` and `bfsha` in `ShaderData`, particles in `EffectData`); its three geometry shaders (a thunder effect) do not translate.
+- **Start-up services:** it calls several system services no other game did, each answered by the host: the aborting `account::OpenPreselectedUser` and `GetLastOpenedUser`, news delivery (`bcat`: the delivery storage does not mount, which the game treats as "nothing delivered"), HOME-button blocking, the parental 3D-mode setting, `vi::SetLayerScalingMode`, `time::ToPosixTimeFromUtc`, the debug pad, and the SDK 7 names of two audio-device calls ([03](agents/03-bringup.md)).
+- **Movies:** MP4 / H.264 (the videos in its tutorial hint boxes, the kingdom travel videos), 41 of 44 High or Main profile with B-frames. The host decodes them with VideoToolbox; the SDK's demuxer passes the parameter sets as the `avcc` record (the MP4 `avcC` box), and pictures leave in presentation order through a small queue.
+- **Sticks:** the game reads all 16 entries of the controller history whatever count comes back; the host now fills every entry (before, only the first, and neither stick did anything in play while buttons and menus worked).
+- **HUD:** the coin counters are layout panes that take their alpha from single-channel render targets, as in Breath of the Wild; the profile lists the 26 layout shaders under `alpha_from_red` (before, they were solid white cards).
+- **Ground:** a depth pre-pass followed by a less-or-equal G-buffer pass needs bit-identical positions from different vertex shaders; every shader is now compiled with `-fpreserve-invariance` (before, the Cap Kingdom ground showed stale 32×32 blocks on every fourth frame) ([04](agents/04-graphics.md)).
+
+**Hades (`0100535012974000`), being ported**
+- **Engine:** Supergiant's engine on The Forge renderer, SDK 9.3.0, update 1.0.38233. It renders with **Vulkan**: `main` imports 100 `vk*` functions from subsdk0 (the Vulkan loader, over NVIDIA's driver in subsdk1). The host implements them on Metal itself (`dm/gfx/vk/hle_vk.m`), so only main and sdk are loaded; the profile says `graphics vulkan`.
+- **Vulkan layer:** one Tegra X1-like device (Vulkan 1.1); device memory is a shared `MTLBuffer` made on first use, images are their own textures; command buffers are recorded and replayed into one Metal command buffer per submit on the layer's own queue; swapchain images are shown through the NVN layer's present path once their frame's GPU work is done. Names the game asks for through `vkGet*ProcAddr` are logged once each.
+- **Shaders:** 74 SPIR-V files in `Content/EffectsForgeSwitch`. `dm/gfx/tools/vk_shaders.py <RomFS> <shader dir> [--ios <dir>]` translates them with SPIRV-Cross into `<dir>/vk/`: one library, and a table of the Metal slot each (set, binding) moved to. The game hands the same words to `vkCreateShaderModule`, so the host finds each shader by the hash of its SPIR-V.
+- **Notification event:** the game polls `oe::GetNotificationMessageEvent` every frame; the SDK's own event was never created (the host's `oe::Initialize` is a no-op), so the host now hands out an event of its own, signalled while a notification is queued.
+- **Online:** its `EOS_*` imports (Epic Online Services, an NRO it would load through `nn::ro`) stay offline.
+- **Mac input:** `DM_KEYS="f800:A,f1000:A,f1200:A,f1500:A,f1900:A"` goes through the title and the intro into Tartarus.
+- **Packing:** the NSP script does not translate Vulkan shaders yet. Run `vk_shaders.py` with `--ios <work folder>/build/ios/dmsh_b`, then `build_ipa.sh` (see [Build by hand](#build-by-hand-mac)).
 
 ## Tools (`dm/tools`)
 

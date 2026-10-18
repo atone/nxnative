@@ -19,7 +19,18 @@ enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mq_cond = PTHREAD_COND_INITIALIZER;   // cond: wakes the blocking PopNotificationMessage
 static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
 static _Atomic int g_ntf_opmode, g_ntf_perfmode;          // only pushed after the game turns it on with Set*NotificationEnabled
-static void mq_push(uint32_t m) {
+// Notification event (Hades main+0x3ed18c polls it every frame and pops one message each time it fires): the SDK's version returns the event oe::Initialize would have
+// created, and the host's oe::Initialize is a no-op, so TryWaitSystemEvent asserted on it. A host-owned auto-clear SystemEvent instead, signalled while the queue holds a message
+static uint8_t g_mq_ev[0x80] __attribute__((aligned(16)));
+static _Atomic int g_mq_ev_on;
+static void mq_ev_kick(void) {
+    if (!atomic_load(&g_mq_ev_on)) return;
+    pthread_mutex_lock(&g_mq_lock); int n = g_mqn; pthread_mutex_unlock(&g_mq_lock);
+    if (n) hle_signal_system_event(g_mq_ev);
+}
+static void mq_push_(uint32_t m);
+static void mq_push(uint32_t m) { mq_push_(m); mq_ev_kick(); }
+static void mq_push_(uint32_t m) {
     pthread_mutex_lock(&g_mq_lock);
     // 15/30/31 are invalidation notifications meaning "query the current state", not events carrying historical values.
     // While one of the same type has not been taken yet, the first queue position is kept: the D2R consumer loop only reads the latest state, repeated notifications write back the same thing, and with the same size there is no further resize.
@@ -75,6 +86,11 @@ HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "启动参数：没有", uns
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "录像开关；宿主无系统录像", void, h_oe_DisableRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "截图开关；宿主无系统截图", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "截图开关；宿主无系统截图", void, h_oe_DisableShot, void) {}
+// Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
+HLE_FORCE("_ZN2nn2oe23BeginBlockingHomeButtonEv", "暂时屏蔽 HOME 键（经 am）；宿主没有 HOME 键", void, h_oe_BlockHome, void) {}
+HLE_FORCE("_ZN2nn2oe21EndBlockingHomeButtonEv", "恢复 HOME 键（经 am）", void, h_oe_UnblockHome, void) {}
+HLE_FORCE("_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE", "截图方向（经 am）；宿主无系统截图", void, h_oe_ShotOrient, int o) { (void)o; }
+HLE_FORCE("_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv", "无操作自动熄屏是否延长；宿主不熄屏，报否", unsigned, h_oe_InactivityExtQ, void) { return 0; }
 
 // OperationMode: 0 Handheld, 1 Console; PerformanceMode: 0 Normal, 1 Boost (one-to-one with the operation mode)
 HLE_FORCE("_ZN2nn2oe16GetOperationModeEv", "运行模式查询；按 DM_OPMODE 给固定值", int, h_oe_GetOpMode, void) { int u = g_ui_opmode; if (atomic_exchange(&g_ui_armed, 0)) atomic_fetch_add(&g_ui_reads, 1); return u >= 0 ? u : opmode(); }
@@ -233,6 +249,7 @@ HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "系统通知队列；前�
     if (ok) for (int i = 0; i < 2; i++) if (g_keyres[i]) pthread_setspecific(g_keyres[i], (void *)dm_game_res(i));
     if (ok && *msg == MSG_PERFMODE) dm_uiscreen_res_reread();
     if (ok) LOG("oe 通知被游戏取走：%u", *msg);   // state changes are rare, printing each one does not flood the log
+    if (ok) mq_ev_kick();   // one message per signal: fire again for the next one
     return ok;
 }
 // The blocking form (Link's Awakening pops on a thread of its own, main+0xfa1ff8): the SDK's version waits on the system event oe::Initialize would have created,
@@ -245,6 +262,10 @@ HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "系统通知队列（阻塞版
         pthread_mutex_unlock(&g_mq_lock);
         if (h_oe_TryPopMsg(&m)) return m;   // another thread may have taken it in between: wait again
     }
+}
+HLE_FORCE("_ZN2nn2oe27GetNotificationMessageEventEv", "通知事件：宿主的自动清除 SystemEvent，队列有通知时触发", void *, h_oe_GetMsgEv, void) {
+    if (!atomic_load(&g_mq_ev_on)) { hle_bind_system_event(g_mq_ev, 1); atomic_store(&g_mq_ev_on, 1); mq_ev_kick(); }   // bound on the game's thread (it runs SDK code)
+    return g_mq_ev;
 }
 // bool arguments: Switch callers do not extend them, declared as unsigned and only the low 8 bits are looked at
 HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "恢复通知开关；宿主的恢复以焦点通知 15 表达", void, h_oe_SetResumeNtf, unsigned on) { (void)on; }

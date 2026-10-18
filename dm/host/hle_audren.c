@@ -9,7 +9,7 @@
 //   3. Takes over AudioRendererImpl::ExecuteAudioRendererRendering (reached through the PLT): generates commands and runs CommandListProcessor like the original,
 //      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and clamps its input mix buffers (int32 holding 16-bit range) to int16 stereo for AudioOut (hle_audio.c).
 // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
-//   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13; 0x10 in SDK 8, 0x14 in SDK 20), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
+//   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
@@ -95,26 +95,27 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "关渲
     orig(obj, state);
 }
 
-// DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44, same layout: 0x148 bytes,
-//   +0x128 upsample buffer, +0x130 input count, +0x134 input indices). render_once sets it by layout
+// DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44); SDK 8 (Link's Awakening)
+//   has four fewer commands before it, making it 0x10. The layout is the same in all three: 0x148 bytes, +0x20 device name ("MainAudioOut"), +0x128 upsample buffer, +0x130 input count,
+//   +0x134 input indices. render_once sets the ID by layout; when the first full command list has no command with that ID, its one 0x148-byte command with 1 to 6 inputs is the sink
+//   (without this, Link's Awakening rendered every frame and played silence: the music and sound effects never reached the output, only the movies' own AudioOut did)
 static int g_sink_id = 0x13;
-// SDK 8 (Link's Awakening) numbers DeviceSink 0x10 (same 0x148-byte layout). Where the SDK exports CommandBuffer::GenerateDeviceSinkCommand, it builds the header
-// (0xcafebabe | enabled << 32 | ID << 40 | size << 48) with a movk chain: SDK 8 has "movk xN, #0xcafe, lsl #16" then "movk xN, #0x1001, lsl #32". The ID is read from there; def when the pattern is absent
-static int sink_id_from_sdk(int def) {
-    const uint32_t *f = guest_sym("_ZN2nn5audio6server13CommandBuffer25GenerateDeviceSinkCommandEiPKNS1_12SinkInfoBaseEjmj");
-    for (int i = 1; f && i < 64; i++)
-        if ((f[i] & 0xffe00000u) == 0xf2c00000u && (f[i - 1] & 0xffe00000u) == 0xf2a00000u && (f[i - 1] >> 5 & 0xffff) == 0xcafe) return f[i] >> 13 & 0xff;
-    return def;
-}
 static int capture(const uint8_t *cl, int16_t *dst) {
     uint32_t ncmd = *(const uint32_t *)(cl + 4), samples = *(const uint32_t *)(cl + 0x14), rate = *(const uint32_t *)(cl + 0x18);
     const int32_t *mix = *(const int32_t *const *)(cl + 8);
-    static int logged;
-    if (!logged && ncmd > 4) {   // first full command list: command ID histogram
-        int hist[64] = {0}; const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
-        for (uint32_t i = 0; i < ncmd && *(const uint32_t *)q == 0xcafebabeu && *(const int16_t *)(q + 6) > 0; i++) { hist[q[5] & 63]++; q += *(const int16_t *)(q + 6); }
+    static int logged, hist_logged;
+    if (!hist_logged && ncmd > 4) {   // first full command list: command ID histogram, and the sink ID check
+        hist_logged = 1;
+        int hist[64] = {0}, cand = -1, ncand = 0; const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
+        for (uint32_t i = 0; i < ncmd && *(const uint32_t *)q == 0xcafebabeu && *(const int16_t *)(q + 6) > 0; i++) {
+            int16_t sz = *(const int16_t *)(q + 6); hist[q[5] & 63]++;
+            if (sz == 0x148 && *(const uint32_t *)(q + 0x130) - 1 < 6) { cand = q[5]; ncand++; }
+            q += sz;
+        }
         for (int k = 0; k < 64; k++) if (hist[k]) o += snprintf(line + o, sizeof line - o, " %d×%d", k, hist[k]);
         LOG("audren：首帧命令 %u 条，按命令号：%s", ncmd, line);
+        if (!hist[g_sink_id & 63] && ncand == 1) { LOG("audren：命令表里没有 %#x 号命令；唯一的 0x148 字节命令是 %#x 号，按它当 DeviceSink", g_sink_id, cand); g_sink_id = cand; }
+        else if (!hist[g_sink_id & 63]) LOG("【红】audren：命令表里没有 DeviceSink（%#x 号），0x148 字节的命令有 %d 个：游戏声音出不来", g_sink_id, ncand);
     }
     const uint8_t *c = cl + 0x20;
     for (uint32_t i = 0; i < ncmd; i++) {
@@ -166,8 +167,8 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
             cbuf = gsym("_ZNK2nn5audio6server17AudioRenderSystem26GetCommandBufferWorkBufferEv"); cbsz = gsym("_ZNK2nn5audio6server17AudioRenderSystem30GetCommandBufferWorkBufferSizeEv");
             gen = gsym("_ZN2nn5audio6server17AudioRenderSystem15GenerateCommandEPvm");
         }
-        mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : sink_id_from_sdk(0x13);
-        LOG("audren：AudioRenderSystem 按 SDK %s 布局（更新锁 +%#zx，DeviceSink 命令号 %#x）", gen20 ? "20" : "16", mu_off, g_sink_id);
+        mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : 0x13;
+        LOG("audren：AudioRenderSystem 按 SDK %s 布局（更新锁 +%#zx）", gen20 ? "20" : "16", mu_off);
         tmax = gsym("_ZN2nn5audio3dsp20CommandListProcessor17SetProcessTimeMaxEj"); setup = gsym("_ZN2nn5audio3dsp20CommandListProcessor5SetupEPKvm");
         process = gsym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
     }
@@ -233,3 +234,6 @@ HLE_FORCE("_ZN2nn5audio24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE", "当
 HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "输出声道数：2", int, h_ad_Channels, void) { return 2; }
 HLE_FORCE("_ZN2nn5audio26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEf", "设备音量；宿主忽略", void, h_ad_SetVol, const char *name, float v) { (void)name; (void)v; }
 HLE_FORCE("_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE", "输出设备变化通知：绑定、永不触发", void, h_ad_Notify, void *ev) { hle_bind_system_event(ev, 0); }
+// SDK 7 names of the two above (Super Mario Odyssey): the device-switch event and the active channel count
+HLE_FORCE("_ZN2nn5audio36AcquireAudioDeviceSwitchNotificationEPNS_2os11SystemEventE", "输出设备切换通知（SDK 7 名）：绑定、永不触发", void, h_ad_Notify7, void *ev) { hle_bind_system_event(ev, 0); }
+HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "输出声道数（SDK 7 名）：2", int, h_ad_Channels7, void) { return 2; }
