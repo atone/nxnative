@@ -141,33 +141,66 @@ static int dev_count(uint32_t style) { return style & (STYLE_JOYLEFT | STYLE_JOY
 static uint32_t dev_handle(uint32_t style, uint32_t id, int i) { return style_index(style) | (id & 0xff) << 8 | (uint32_t)i << 16; }
 static int dev_side(uint32_t h) { uint32_t st = h & 0xff; return st == 6 ? 0 : st == 7 ? 1 : (int)(h >> 16 & 1); }
 
-// Six-axis: the front end's samples (dm_motion_set) integrated into angle (revolutions) and direction (rotation matrix, rows = the controller's x / y / z axes), as nn::hid::SixAxisSensorState:
-// { i64 delta time ns, i64 sampling number, float3 acceleration (G), float3 angular velocity (rev/s), float3 angle (rev), float3x3 direction, u32 attributes (bit 0 connected), u32 reserved } = 0x60 bytes
+// Six-axis: the front end's samples (dm_motion_set), as nn::hid::SixAxisSensorState:
+// { i64 delta time ns, i64 sampling number, float3 acceleration (G), float3 angular velocity (rev/s), float3 angle (rev), float3x3 direction, u32 attributes (bit 0 connected), u32 reserved } = 0x60 bytes.
+// Angle is the integrated angular velocity. Direction is an orientation kept by sensor fusion (Mahony's complementary filter: the gyro turns a quaternion, the accelerometer pulls its gravity
+// estimate back, so it does not drift and stays level), turned into the three axis vectors in the layout yuzu's MotionInput hands to games (its quaternion component order and signs), which games
+// were written against on hardware. Integrating the gyro alone into a matrix, as before, kept no gravity reference and composed the turns the other way round: in Breath of the Wild the bow's
+// up and down came out reversed, magnesis barely turned left and right, and after a while of use the aim moved diagonally
 typedef struct { int64_t dt_ns, sampling; float acc[3], gyro[3], angle[3], dir[3][3]; uint32_t attributes, _rsv; } SixAxisState;
 _Static_assert(sizeof(SixAxisState) == 0x60, "SixAxisState");
 static pthread_mutex_t g_six_mu = PTHREAD_MUTEX_INITIALIZER;
 static SixAxisState g_six = {.dir = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
 static int64_t g_six_last_ns; static int g_six_on;
-void dm_motion_set(const float acc[3], const float gyro_rps[3]) {
+static struct { double q[4]; double err[3], ierr[3]; int still; } g_fu = {.q = {0, 0, -1, 0}};   // q = (x, y, z, w); starts level
+enum { FU_KP = 0, FU_KI = 1 };
+static const double g_fu_k[2] = {0.3, 0.005};
+static double fu_norm3(const double *v) { return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+// one fusion step: w = angular velocity in rad/s in the filter's axes, a = normalized acceleration (or NULL), gain scales the correction
+static void fu_step(double *w, const double *a, double gain, double dt) {
+    double *q = g_fu.q, x = q[0], y = q[1], z = q[2], qw = q[3];
+    if (a) {
+        double ax = -a[0], ay = a[1], az = -a[2];
+        double vx = 2 * (x * z - qw * y), vy = 2 * (qw * x + y * z), vz = qw * qw - x * x - y * y + z * z;   // gravity as the quaternion sees it
+        double e[3] = {az * vx - ax * vz, ay * vz - az * vy, ax * vy - ay * vx};                          // measured vs estimated
+        memcpy(g_fu.err, e, sizeof e);
+        for (int i = 0; i < 3; i++) { if (fu_norm3(e) >= 0.05) g_fu.ierr[i] += e[i]; else g_fu.ierr[i] = 0; w[i] += gain * (g_fu_k[FU_KP] * e[i] + g_fu_k[FU_KI] * g_fu.ierr[i]); }
+    }
+    double gx = w[1], gy = w[0], gz = w[2], h = 0.5 * dt;
+    double nw = qw + (-x * gx - y * gy - z * gz) * h;
+    double nx = x + (nw * gx + y * gz - z * gy) * h, ny = y + (nw * gy - x * gz + z * gx) * h, nz = z + (nw * gz + x * gy - y * gx) * h;
+    double n = sqrt(nx * nx + ny * ny + nz * nz + nw * nw); if (n > 0) { q[0] = nx / n; q[1] = ny / n; q[2] = nz / n; q[3] = nw / n; }
+}
+static void fu_direction(float d[3][3]) {
+    const double *q = g_fu.q; double x = -q[1], y = -q[0], z = -q[3], w = -q[2];   // the component order and signs games see
+    double m[9] = {1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y),
+                   2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x),
+                   2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)};
+    d[0][0] = (float)m[0]; d[0][1] = (float)m[1]; d[0][2] = (float)-m[2];
+    d[1][0] = (float)m[3]; d[1][1] = (float)m[4]; d[1][2] = (float)-m[5];
+    d[2][0] = (float)-m[6]; d[2][1] = (float)-m[7]; d[2][2] = (float)m[8];
+}
+void dm_motion_set(const float acc_in[3], const float gyro_in[3]) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); int64_t now = (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
     pthread_mutex_lock(&g_six_mu);
     int64_t dt = g_six_last_ns ? now - g_six_last_ns : 0; if (dt > 100000000) dt = 0;   // first sample or a long gap: no integration step
-    g_six_last_ns = now; g_six.dt_ns = dt; g_six.sampling++;
-    double s = dt / 1e9, w[3], th = 0;
-    for (int i = 0; i < 3; i++) { g_six.acc[i] = acc[i]; g_six.gyro[i] = gyro_rps[i]; g_six.angle[i] += (float)(gyro_rps[i] * s); w[i] = gyro_rps[i] * s * 2 * M_PI; th += w[i] * w[i]; }
-    th = sqrt(th);
-    if (th > 1e-9) {   // direction = direction × R(ω dt) (Rodrigues), then re-orthonormalized (Gram-Schmidt) so rounding does not shear it
-        double k[3] = {w[0] / th, w[1] / th, w[2] / th}, c = cos(th), sn = sin(th), C = 1 - c, R[3][3] = {
-            {c + k[0] * k[0] * C, k[0] * k[1] * C - k[2] * sn, k[0] * k[2] * C + k[1] * sn},
-            {k[1] * k[0] * C + k[2] * sn, c + k[1] * k[1] * C, k[1] * k[2] * C - k[0] * sn},
-            {k[2] * k[0] * C - k[1] * sn, k[2] * k[1] * C + k[0] * sn, c + k[2] * k[2] * C}};
-        double D[3][3];
-        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { D[i][j] = 0; for (int m = 0; m < 3; m++) D[i][j] += g_six.dir[i][m] * R[m][j]; }
-        for (int i = 0; i < 3; i++) { for (int p = 0; p < i; p++) { double d = 0; for (int j = 0; j < 3; j++) d += D[i][j] * D[p][j]; for (int j = 0; j < 3; j++) D[i][j] -= d * D[p][j]; }
-                                      double l = sqrt(D[i][0] * D[i][0] + D[i][1] * D[i][1] + D[i][2] * D[i][2]); for (int j = 0; j < 3; j++) g_six.dir[i][j] = (float)(l > 0 ? D[i][j] / l : (i == j)); }
+    g_six_last_ns = now; g_six.dt_ns = dt ? dt : 5000000; g_six.sampling++;
+    double a[3], g[3], s = dt / 1e9;
+    for (int i = 0; i < 3; i++) { a[i] = fmax(-7, fmin(7, acc_in[i])); g[i] = fmax(-5, fmin(5, gyro_in[i])); }
+    if (fu_norm3(g) < 0.007) g[0] = g[1] = g[2] = 0;   // below noise: no turn
+    for (int i = 0; i < 3; i++) { g_six.acc[i] = (float)a[i]; g_six.gyro[i] = (float)g[i]; g_six.angle[i] += (float)(g[i] * s); }
+    double an = fu_norm3(a), na[3] = {an > 0 ? a[0] / an : 0, an > 0 ? a[1] / an : 0, an > 0 ? a[2] / an : 0};
+    int rest = fu_norm3(g) < 0.05 && an > 0.9 && an < 1.1;
+    if (fu_norm3(g_fu.err) >= 0.1 && rest && a[2] <= -0.9) {   // lying flat and still but the estimate disagrees for 900 samples: start level again and settle on the accelerometer
+        if (++g_fu.still > 900) { g_fu.q[0] = g_fu.q[1] = g_fu.q[3] = 0; g_fu.q[2] = -1; for (int i = 0; i < 100; i++) { double w0[3] = {0}; fu_step(w0, na, 10, 0.015); if (fu_norm3(g_fu.err) < 0.01) break; } g_fu.still = 0; memset(g_fu.ierr, 0, sizeof g_fu.ierr); }
+    } else g_fu.still = 0;
+    if (s > 0 && s <= 0.1) {
+        double w[3] = {g[1] * 2 * M_PI, -g[0] * 2 * M_PI, -g[2] * 2 * M_PI};   // the filter's axes
+        fu_step(w, an >= 0.75 && an <= 1.25 ? na : NULL, 1, s);   // no correction while the acceleration is not mostly gravity
     }
+    fu_direction(g_six.dir);
     g_six.attributes = 1;
-    if (!g_six_on++) LOG("六轴：前端开始送数据（加速度 %.2f %.2f %.2f G）", acc[0], acc[1], acc[2]);
+    if (!g_six_on++) LOG("六轴：前端开始送数据（加速度 %.2f %.2f %.2f G）", a[0], a[1], a[2]);
     pthread_mutex_unlock(&g_six_mu);
 }
 static int six_get(SixAxisState *o) { pthread_mutex_lock(&g_six_mu); *o = g_six; pthread_mutex_unlock(&g_six_mu); return o->attributes != 0; }
