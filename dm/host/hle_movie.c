@@ -71,6 +71,7 @@ typedef struct {
     // Vorbis: the identification and setup headers from Configure's MediaData ("csd-0", "csd-1", as with Android's MediaCodec), the decoder (opened at the first packet), channels / rate, Ogg page sequence
     uint8_t *vhdr[2]; int vhdr_n[2]; stb_vorbis *vb; int ch, rate; uint32_t ogg_seq; int64_t ogg_gran; int red_vb;
     uint64_t dec_n, dec_ns, dec_max;            // decode timing (on the host thread, per packet)
+    int64_t pace_pts0, pace_last_pts; uint64_t pace_t0, pace_last_call, pace_sig;   // movie_pace: wall clock and timestamp of the frame the pacing started from (see h_movie_AcqOut)
     unsigned long ncall[24];
 } mdec_t;
 
@@ -112,13 +113,14 @@ void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stac
 static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
 static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
 static void md_defer_body(void *arg);
-static void md_defer(void *d, int ev) {
+static void md_defer_at(void *d, int ev, uint64_t due) {
     pthread_mutex_lock(&g_dfmu);
     if (!g_dfthr) { g_dfthr = 1; dm_guest_thread_spawn(md_defer_body, NULL, 16, 64 << 10); }
-    if (g_ndfq < 64) g_dfq[g_ndfq++] = (__typeof__(g_dfq[0])){d, ev, now_ns() + 2000000};
+    if (g_ndfq < 64) g_dfq[g_ndfq++] = (__typeof__(g_dfq[0])){d, ev, due};
     else LOG("【红】影片：延后事件队列满，丢一个");
     pthread_cond_signal(&g_dfcv); pthread_mutex_unlock(&g_dfmu);
 }
+static void md_defer(void *d, int ev) { md_defer_at(d, ev, now_ns() + 2000000); }
 static void md_defer_drop(void *d) {
     pthread_mutex_lock(&g_dfmu);
     int n = 0; for (int i = 0; i < g_ndfq; i++) if (g_dfq[i].d != d) g_dfq[n++] = g_dfq[i];
@@ -457,6 +459,7 @@ static void md_reset(mdec_t *d, int close) {
     pthread_mutex_lock(&d->mu);
     for (int i = 0; i < MD_NIN; i++) d->infree[i] = i;
     d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0; d->avc_drain = 0;
+    d->pace_t0 = 0; d->pace_sig = 0;   // the pacing starts again at the next frame
     for (int i = 0; i < MD_NOUT; i++) d->out[i].used = d->out[i].pic = 0;
     pthread_mutex_unlock(&d->mu);
     pthread_mutex_unlock(&d->dmu);
@@ -515,13 +518,33 @@ HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "影片解码器�
     return 0;
 }
 
+// movie_pace (game profile; DM_MOVIE_PACE=0/1 overrides): a video frame leaves only once its timestamp, counted from the frame the pacing started at, is due by the wall clock.
+// Breath of the Wild's player shows each frame it gets and asks once per game frame; at 60 fps its pre-rendered cutscenes (the Great Plateau tower rising) ran at double speed and ended
+// while their sound played on. The start is taken again at the first frame, when a timestamp goes backwards (a new movie, a loop) and after 250 ms without a request (paused);
+// end-of-stream buffers always pass. A held frame gets its "output available" event again when it is due (the players wait for it before asking). Caller holds d->mu
+static int md_pace_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_MOVIE_PACE"); on = e && *e ? atoi(e) != 0 : DM_GAME_MOVIE_PACE; if (on) LOG("影片：按时间戳放帧（movie_pace）"); } return on; }
+static int md_pace_hold(mdec_t *d, int s) {
+    if (d->type == MD_TYPE_VORBIS || !md_pace_on() || (d->out[s].flags & 4)) return 0;
+    uint64_t now = now_ns();   // the clock of the deferred events (md_defer_at)
+    int64_t pts = d->out[s].pts; uint64_t gap = d->pace_last_call ? now - d->pace_last_call : ~0ull;
+    d->pace_last_call = now;
+    if (!d->pace_t0 || pts < d->pace_last_pts || gap > 250000000ull) { d->pace_t0 = now; d->pace_pts0 = pts; d->pace_last_pts = pts; return 0; }
+    uint64_t due = d->pace_t0 + (uint64_t)((pts - d->pace_pts0) * 1000);
+    if ((int64_t)(due - now) > 4000000) {   // not due yet (4 ms early is fine). The player asks again only after an "output available" event, so one is signalled when the frame is due
+        if (d->pace_sig <= now) { d->pace_sig = due; md_defer_at(d, 1, due); }
+        return 1;
+    }
+    d->pace_last_pts = pts;
+    { static uint64_t t1; static int n; n++; if (!t1) t1 = now; if (now - t1 >= 2000000000ull) { LOG("影片：按时间戳放帧 %.1f 帧/秒（时间戳 %.2f s）", n * 1e9 / (double)(now - t1), pts / 1e6); n = 0; t1 = now; } }
+    return 0;
+}
 HLE_FORCE("_ZN5movie7Decoder24AcquireOutputBufferIndexEPiPlPjS1_", "影片解码器：取就绪输出号", int, h_movie_AcqOut,
           void **self, int *idx, int64_t *pts, uint32_t *flags, int *left) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
     if (!idx || !pts || !flags || !left) return 0x100b;
     pthread_mutex_lock(&d->mu);
     int r = MD_NO_OUTPUT; *idx = -1; *left = 0;
-    if (d->noutq && d->started) {
+    if (d->noutq && d->started && !md_pace_hold(d, d->outq[0])) {
         int s = d->outq[0]; memmove(d->outq, d->outq + 1, --d->noutq * sizeof *d->outq);
         *idx = s; *pts = d->out[s].pts; *flags = d->out[s].flags; *left = d->noutq; r = 0;
     }

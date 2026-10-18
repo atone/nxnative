@@ -101,6 +101,10 @@ def header(g):
     if any(not re.fullmatch(r'[0-9a-f]{8,16}', k) for k in afr): sys.exit(f'{g.id}: alpha_from_red 要写片元着色器键（8–16 位小写十六进制）| alpha_from_red takes fragment shader keys (8-16 lowercase hex digits): {afr}')
     a1 = g.words('alpha_one', '')   # fragment shader key prefixes that drawing into RGB10A2 read render targets mapped (R, G, B, 0) with alpha = 1 (nvn_mtl.m tex_alpha_one); none by default
     if any(not re.fullmatch(r'[0-9a-f]{8,16}', k) for k in a1): sys.exit(f'{g.id}: alpha_one 要写片元着色器键（8–16 位小写十六进制）| alpha_one takes fragment shader keys (8-16 lowercase hex digits): {a1}')
+    mp = g.get('movie_pace', 'off')   # on: video frames leave the movie decoder no earlier than their timestamps (hle_movie.c), for a game whose player shows every frame it gets at a higher frame rate
+    if mp not in ('on', 'off'): sys.exit(f'{g.id}: movie_pace 只能是 on / off | movie_pace must be on or off: {mp}')
+    prs = g.get('pad_repeat_step', '0')   # main-module offset of the float the controller's hold counters advance by per update; the host keeps it at present interval / 2 (hle_nvn.c), 0 = none
+    if not re.fullmatch(r'0x[0-9a-fA-F]+|0', prs): sys.exit(f'{g.id}: pad_repeat_step 要写 main 内偏移（0x…）| pad_repeat_step takes a main offset (0x...): {prs}')
     api = g.get('device_api', '55.15')   # the NVN API major.minor version nvnDeviceGetInteger reports (hle_nvn.c)
     if not re.fullmatch(r'\d+\.\d+', api): sys.exit(f'{g.id}: device_api 要写成 主.次 | device_api must be major.minor: {api}')
     src = f'dm/games/{g.id}' if g.dir.parent == HERE else str(g.dir)
@@ -130,6 +134,8 @@ def header(g):
          f'#define DM_GAME_FEEDBACK_SNAP {q(" ".join(fbs))}',
          f'#define DM_GAME_ALPHA_FROM_RED {q(" ".join(afr))}',
          f'#define DM_GAME_ALPHA_ONE {q(" ".join(a1))}',
+         f'#define DM_GAME_MOVIE_PACE {int(mp == "on")}',
+         f'#define DM_GAME_PAD_REPEAT_STEP {int(prs, 16):#x}',
          f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}',
          f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}',
          '']

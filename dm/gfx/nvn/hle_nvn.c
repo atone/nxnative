@@ -925,7 +925,22 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
-NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
+// pad_repeat_step (game profile): the float the game's sead controllers add to each held button's counter per update, kept at present interval / 2. Breath of the Wild's repeat delays and pulses
+// are counted in 30 fps frames with a step that stays 1.0; at 60 fps (the 60 fps cut lowers the interval to 1) the weapon wheel and the menus repeated twice as fast, so one flick moved two or
+// three slots. At interval 1 the step is 0.5, at 2 1.0, at 3 1.5: the same ratio the game's own variable frame rate applies. The first write checks that the float still reads 1.0
+static void pad_step_set(int interval) {
+#if DM_GAME_PAD_REPEAT_STEP
+    static int ok = -1; static float *p;
+    if (ok < 0) {
+        ok = 0; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main") && DM_GAME_PAD_REPEAT_STEP + 4 <= g_mod[i].size) p = (float *)(g_mod[i].base + DM_GAME_PAD_REPEAT_STEP);
+        if (p && *p == 1.0f) ok = 1; else LOG("【红】pad_repeat_step：main+%#x 读到 %g，不是 1.0，不改", DM_GAME_PAD_REPEAT_STEP, p ? *p : -1.f);
+    }
+    if (ok && interval > 0) { float s = interval * 0.5f; if (*p != s) { *p = s; LOG("[nvn] 手柄连发步长 %.1f（出图间隔 %d）", s, interval); } }
+#else
+    (void)interval;
+#endif
+}
+NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; pad_step_set(v); }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);

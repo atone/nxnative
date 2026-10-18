@@ -58,3 +58,5 @@ nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
 # ---- 着色器拆分（shader_split.py） | Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /Layout/=layout /System/=gsys /Terrain/=terrain
 shader_note	塞尔达传说 旷野之息着色器
+movie_pace	on
+pad_repeat_step	0x1dad0e0
