@@ -2533,14 +2533,15 @@ static id<MTLTexture> tex_alpha_red(int tid, id<MTLTexture> t, uint64_t *rid) {
     r->ar = (void *)CFBridgingRetain(v); r->ar_of = (__bridge void *)t; r->ar_rid = v.gpuResourceID._impl;
     *rid = r->ar_rid; return v;
 }
-// Alpha one: the fragment shaders the game profile's alpha_one lists read an RGB10A2 render target as (R, G, B, 1).
-// Breath of the Wild's menu background: when the inventory or the system menu opens, ecb4242efaf4042b copies the final 1920x1080 RGB10A2 image through a view the game registers with
-// mapping (R, G, B, 0) (nvnTextureViewSetSwizzle; the real driver's TIC builder encodes the 0 as constant zero), further passes shrink, blur and colour-grade it into a 320x180 RGB10A2
-// target, carrying the alpha of 0 along, and the layout shader 87d900168952ea49 draws the result full screen blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA: read literally the menu sits on black,
-// on the Switch the blurred scene shows. The alpha of 0 is right elsewhere: the HUD captures (text glows and shadows, the noise meter) start from the same copy and draw their text or
-// waveform over it, so its alpha is the mask; forcing the copy to 1 turns those into solid boxes. So the rule sits on the shader that draws the captured scene as a picture. RGB10A2 keeps
-// 2 bits of alpha, never a soft mask, and the layout's RGB10A2 render targets are these scene captures. How the hardware shows them is not understood.
-// DM_NVN_ALPHA_ONE=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
+// Alpha one: the fragment shaders the game profile's alpha_one lists, drawing into an RGB10A2 colour target, read a render target whose channel mapping is exactly (R, G, B, 0)
+// as (R, G, B, 1). Breath of the Wild copies the final 1920x1080 RGB10A2 image with ecb4242efaf4042b through a view it registers with mapping (R, G, B, 0) (nvnTextureViewSetSwizzle;
+// the real driver's TIC builder encodes the 0 as constant zero) for two kinds of layout captures:
+// - scene pictures, copied into RGB10A2 targets, shrunk, blurred, colour-graded and drawn blended by their alpha: the inventory / system menu background (1280x720 -> 320x180, layout
+//   shader 87d900168952ea49), the weapon / item wheel's slots (636x130, 11bb9006c60d49d6: colour = mix(slot mask, capture, capture alpha)), the bag's side strips (75x300, 75x810).
+//   Read literally the menu sat on black and the slots were white; on the Switch both show the blurred scene;
+// - HUD masks, copied into RGBA8 targets, with text or a waveform drawn over the copy and the resulting alpha used as the mask (text glows and shadows, the noise meter). Their 0 is
+//   right: with alpha 1 the monk's words sat on a black box, the Sheikah pedestal's message in a hard-edged cloud rectangle, and the noise meter was filled.
+// So the target format decides. How the hardware gets alpha 1 for the first kind is not understood. DM_NVN_ALPHA_ONE=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
 static char g_a1_keys[48][20]; static int g_a1_nk = -1;
 static int a1_want(NvShader *sh) {
     if (!sh->a1) {
@@ -2553,8 +2554,8 @@ static int a1_want(NvShader *sh) {
 }
 static id<MTLTexture> tex_alpha_one(int tid, id<MTLTexture> t, uint64_t *rid) {
     MTLTextureSwizzleChannels sw = t.swizzle;
-    if (t.pixelFormat != MTLPixelFormatRGB10A2Unorm || tid <= 0 || tid >= g_ntreg) return nil;
-    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) return nil;
+    if (g_pass.cfmt[0] != MTLPixelFormatRGB10A2Unorm || tid <= 0 || tid >= g_ntreg) return nil;
+    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleZero) return nil;
     id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
     if (!(base.usage & MTLTextureUsageRenderTarget)) return nil;
     treg_t *r = &g_treg[tid];
