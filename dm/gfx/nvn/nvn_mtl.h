@@ -46,3 +46,5 @@ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_v
 void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
 void mtl_ui_ghost(int on, float px, float py, const float grid[4], float cx, float cy);   // Drag-follow image for shop items: when on=1, the icon of the item that covers screen point (px,py) and sits on the shop shelf grid `grid` (top-left x,y, width and height of one cell) is translated to center (cx,cy) and drawn once more at the end of the UI pass (normalized, top-left origin); callable from any thread
 int mtl_ui_ghost_rect(float r[4]);   // Screen rectangle (normalized) of the item recognized above; returns 0 if not recognized yet
+void mtl_hostw_lock(int on);                 // the host writing a texture from another thread (movie output): whole frames only, see nvn_mtl.m g_hostw_mu
+void mtl_tex_host_written(const void *nvntex);   // a tex_t; caller holds the lock

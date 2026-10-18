@@ -1583,7 +1583,7 @@ int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, si
     if (t->magic != MAGIC('T', 'E', 'X', 0)) return -1;
     if (tw) *tw = (int)t->d.width;
     if (th) *th = (int)t->d.height;
-    if (src) { NVNcopyRegion r = {0, 0, 0, w, h, 1}; write_texels(t, NULL, &r, src, row, 0); }
+    if (src) { NVNcopyRegion r = {0, 0, 0, w, h, 1}; mtl_hostw_lock(1); mtl_tex_host_written(t); write_texels(t, NULL, &r, src, row, 0); mtl_hostw_lock(0); }   // whole frames only (see nvn_mtl.m g_hostw_mu)
     return (int)t->d.format;
 }
 // work the host finished on the CPU: the sync object counts as signalled at once (fence 0 is always complete)

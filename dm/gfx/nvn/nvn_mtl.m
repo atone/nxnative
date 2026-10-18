@@ -1088,6 +1088,18 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
     g_up_blits[g_nup_blits++] = (up_blit){src, off, row, image, size, dst, slice, level};
 }
 
+// Textures the host itself writes on another thread (the movie decoder's native-texture output, nvn_host_write_texture): the writer holds g_hostw_mu for the whole frame, and their
+// uploads take the CPU path (a staging copy made now) under the same lock. The GPU path reads the pool when the upload runs, and an upload caught mid-write mixed two frames:
+// Breath of the Wild's pre-rendered cutscenes flashed a garbled picture every few seconds
+static pthread_mutex_t g_hostw_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableSetRef g_hostw;
+void mtl_hostw_lock(int on) { if (on) pthread_mutex_lock(&g_hostw_mu); else pthread_mutex_unlock(&g_hostw_mu); }
+void mtl_tex_host_written(const void *nvntex) {   // caller holds g_hostw_mu
+    const tex_t *t = nvntex;
+    if (!t->serial) return;
+    if (!g_hostw) g_hostw = CFSetCreateMutable(NULL, 0, NULL);
+    if (!CFSetContainsValue(g_hostw, (const void *)(uintptr_t)t->serial)) { CFSetAddValue(g_hostw, (const void *)(uintptr_t)t->serial); MLOG("宿主写的贴图 ser=%llu %ux%u：上传走 CPU 快照并与写入互斥", (unsigned long long)t->serial, t->d.width, t->d.height); }
+}
+static int tex_host_written(uint64_t serial) { pthread_mutex_lock(&g_hostw_mu); int r = g_hostw && CFSetContainsValue(g_hostw, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_hostw_mu); return r; }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp);
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
@@ -1120,8 +1132,9 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int use_gpu = g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
-    if (g_nvn_deswz_gpu && !use_gpu) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
+    int hw = tex_host_written(t->serial);
+    int use_gpu = !hw && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
+    if (g_nvn_deswz_gpu && !use_gpu && !hw) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
@@ -1152,6 +1165,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
     res_add(stg); [g_up_keep addObject:stg];
     size_t off = 0;
+    if (hw) { pthread_mutex_lock(&g_hostw_mu); nvn_dirty_protect(t->mem, t->L.size); *stamp = nvn_dirty_now(); }   // a whole frame: the writer is not in the middle of one
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
@@ -1161,6 +1175,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
             off += pitch * rows * z;
         }
     }
+    if (hw) pthread_mutex_unlock(&g_hostw_mu);
     up_flush();
     return mt;
 }
