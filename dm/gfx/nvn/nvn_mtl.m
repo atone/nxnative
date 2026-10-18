@@ -2035,7 +2035,7 @@ static void shmap_load(void) {
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
-    NSString *fv_key; uint32_t fv_locs; NvShader *fv; int fv_tried; NSMutableDictionary<NSNumber *, NvShader *> *fv_mix; } @end   // fv: float-input variant <key>_bv of a vertex shader whose fv_locs inputs are declared as integers; fv_mix: mixed declarations by integer-location mask (see vs_for_formats)
+    NSString *fv_key; uint32_t fv_locs; NvShader *fv; int fv_tried; NSMutableDictionary<NSString *, id> *fv_mix; uint32_t i2f_locs; } @end   // fv: float-input variant <key>_bv of a vertex shader whose fv_locs inputs are declared as integers; fv_mix: inputs re-declared at run time, by source and location masks (NSNull: failed), i2f_locs: the ones there that convert integers to float (see vs_for_formats)
 @implementation NvShader @end
 #include "nvn_pso_skey.h"
 @interface NvProg : NSObject { @public NvShader *sh[6]; } @end
@@ -2631,9 +2631,10 @@ static void state_reset(void) {
 // Correct the vertex format by the shader input's component type: Metal requires integer inputs to get integer formats of the same signedness, and float inputs float / normalized formats.
 // Integer input (inferred at translation time as "only used as an integer", dmsh_build.py int_inputs) with an integer format: on a signedness mismatch switch to the same width with the other sign (bit pattern unchanged); with a 32-bit float format read it as an integer of the same width (bit pattern unchanged).
 // Other mismatches (integer input with a normalized / half format, float input with an integer format) cannot keep the bit pattern: report once and keep the format.
+static const MTLVertexFormat VF_U[] = { MTLVertexFormatUChar, MTLVertexFormatUChar2, MTLVertexFormatUChar3, MTLVertexFormatUChar4, MTLVertexFormatUShort, MTLVertexFormatUShort2, MTLVertexFormatUShort3, MTLVertexFormatUShort4, MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4 };
+static const MTLVertexFormat VF_I[] = { MTLVertexFormatChar, MTLVertexFormatChar2, MTLVertexFormatChar3, MTLVertexFormatChar4, MTLVertexFormatShort, MTLVertexFormatShort2, MTLVertexFormatShort3, MTLVertexFormatShort4, MTLVertexFormatInt, MTLVertexFormatInt2, MTLVertexFormatInt3, MTLVertexFormatInt4 };
 static MTLVertexFormat vfmt_for_ct(MTLVertexFormat f, int ct, int nvn_fmt) {
-    static const MTLVertexFormat U[] = { MTLVertexFormatUChar, MTLVertexFormatUChar2, MTLVertexFormatUChar3, MTLVertexFormatUChar4, MTLVertexFormatUShort, MTLVertexFormatUShort2, MTLVertexFormatUShort3, MTLVertexFormatUShort4, MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4 };
-    static const MTLVertexFormat I[] = { MTLVertexFormatChar, MTLVertexFormatChar2, MTLVertexFormatChar3, MTLVertexFormatChar4, MTLVertexFormatShort, MTLVertexFormatShort2, MTLVertexFormatShort3, MTLVertexFormatShort4, MTLVertexFormatInt, MTLVertexFormatInt2, MTLVertexFormatInt3, MTLVertexFormatInt4 };
+    const MTLVertexFormat *U = VF_U, *I = VF_I;
     static const MTLVertexFormat F[] = { MTLVertexFormatFloat, MTLVertexFormatFloat2, MTLVertexFormatFloat3, MTLVertexFormatFloat4 };
     int iu = -1, ii = -1, iff = -1;
     for (int i = 0; i < 12; i++) { if (U[i] == f) iu = i; if (I[i] == f) ii = i; }
@@ -2661,6 +2662,13 @@ static MTLVertexFormat vfmt(int f) {
         case 0x3D: return MTLVertexFormatUInt1010102Normalized; case 0x69: return MTLVertexFormatInt1010102Normalized; case 0x3F: return MTLVertexFormatFloatRG11B10; case 0x9A: return MTLVertexFormatUChar4Normalized_BGRA;
     }
     return MTLVertexFormatInvalid;
+}
+// *_UI2F / *_I2F (0x51–0x68, R8_UI2F … RGBA32_I2F): integer data the fetch converts to float without normalizing (RG8_UI2F reads 0..255). Metal has no such format, so it is fetched as the integer format
+// of the same width and the shader converts (vs_rewrite); 0 for every other format
+static MTLVertexFormat vfmt_i2f(int f) {
+    if (f < 0x51 || f > 0x68) return MTLVertexFormatInvalid;
+    int i = (f - 0x51) >> 1;   // components (i / 3) by width (i % 3: 8 / 16 / 32 bits); odd formats are the signed ones
+    return ((f - 0x51) & 1 ? VF_I : VF_U)[i % 3 * 4 + i / 3];
 }
 static MTLBlendFactor bfac(int f) {
     switch (f) { case 1: return MTLBlendFactorZero; case 2: return MTLBlendFactorOne; case 3: return MTLBlendFactorSourceColor; case 4: return MTLBlendFactorOneMinusSourceColor;
@@ -2692,48 +2700,62 @@ static int vfmt_int(MTLVertexFormat f) {
     }
 }
 static NvShader *shader_load(NSString *pc, int stage);
-// Mixed: in one draw some of those inputs get integer formats (bone indices, RG8UI) and others float ones. Built from the variant's MSL (shipped next to the libraries): the integer locations are declared uint4
-// again and read through as_type<float4>, so the float-declared code sees the same bits (Link's Awakening: the canopy of the tree behind Marin's house, whose bone indices read as floats, flew off). Cached by mask
-static NvShader *vs_mixed(NvShader *fv, NSString *name, uint32_t imask) {
+// Mixed: in one draw some of those inputs get integer formats (bone indices, RG8UI) and others float ones. Built from the variant's MSL (shipped next to the libraries): the integer locations (imask) are declared uint4
+// again and read through as_type<float4>, so the float-declared code sees the same bits (Link's Awakening: the canopy of the tree behind Marin's house, whose bone indices read as floats, flew off).
+// Float inputs bound to a *_UI2F / *_I2F format (umask / smask; see vfmt_i2f) are declared uint4 / int4 and read through float4(), from the variant's MSL or the shader's own <key>.metal: Breath of the Wild's
+// grass (uking_grass var3 / var7) gets each vertex's place in the blade (side 0..2, height step 0..3) as RG8_UI2F; read as 0, every blade collapsed to a point. NULL without the MSL (iOS ships only <key>_bv.metal)
+static NvShader *vs_rewrite(NvShader *base, NSString *name, uint32_t imask, uint32_t umask, uint32_t smask) {
     NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.metal", g_msl_dir, name] encoding:NSUTF8StringEncoding error:nil];
     if (!src) return nil;
     NSMutableString *m = [src mutableCopy];
-    for (int l = 0; l < 32; l++) if (imask >> l & 1) {
+    for (int l = 0; l < 32; l++) if ((imask | umask | smask) >> l & 1) {
         NSRegularExpression *decl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"float4 (m_\\d+) \\[\\[attribute\\(%d\\)\\]\\]", l] options:0 error:nil];
         NSTextCheckingResult *r = [decl firstMatchInString:m options:0 range:NSMakeRange(0, m.length)]; if (!r) continue;
         NSString *name = [m substringWithRange:[r rangeAtIndex:1]];
-        [m replaceCharactersInRange:r.range withString:[NSString stringWithFormat:@"uint4 %@ [[attribute(%d)]]", name, l]];
+        [m replaceCharactersInRange:r.range withString:[NSString stringWithFormat:@"%@ %@ [[attribute(%d)]]", smask >> l & 1 ? @"int4" : @"uint4", name, l]];
         NSRegularExpression *use = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\bin\\.%@\\b", name] options:0 error:nil];
-        [use replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:[NSString stringWithFormat:@"as_type<float4>(in.%@)", name]];
+        [use replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:[NSString stringWithFormat:imask >> l & 1 ? @"as_type<float4>(in.%@)" : @"float4(in.%@)", name]];
     }
     MTLCompileOptions *co = [MTLCompileOptions new]; co.preserveInvariance = YES;   // as every packaged library (-fpreserve-invariance): depth pre-pass and main pass agree on positions
     NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:m options:co error:&e];
-    id<MTLFunction> fn = [lib newFunctionWithName:fv->fn.name];   // main0 or main0_z, as the variant was loaded (see shader_load)
-    if (!fn) { MLOG("【红】顶点着色器 %s 的混合输入版本编不出：%s", fv->key, e.localizedDescription.UTF8String); return nil; }
-    NvShader *o = [NvShader new]; o->fn = fn; o->rf = fv->rf; o->stage = fv->stage; strlcpy(o->key, fv->key, sizeof o->key);
-    for (int v = 0; v < o->rf.nv; v++) if (imask >> o->rf.v[v].loc & 1) o->rf.v[v].ct = NVN_CT_UINT;
+    id<MTLFunction> fn = [lib newFunctionWithName:base->fn.name];   // main0 or main0_z, as the shader was loaded (see shader_load)
+    if (!fn) { MLOG("【红】顶点着色器 %s 的改声明输入版本编不出：%s", base->key, e.localizedDescription.UTF8String); return nil; }
+    NvShader *o = [NvShader new]; o->fn = fn; o->rf = base->rf; o->stage = base->stage; strlcpy(o->key, base->key, sizeof o->key);
+    o->i2f_locs = umask | smask;
+    for (int v = 0; v < o->rf.nv; v++) { int l = o->rf.v[v].loc; if ((imask | umask) >> l & 1) o->rf.v[v].ct = NVN_CT_UINT; else if (smask >> l & 1) o->rf.v[v].ct = NVN_CT_INT; }
     return o;
 }
 static NvShader *vs_for_formats(NvShader *vs, const pso_key *k) {
-    if (!vs->fv_key) return vs;
-    const nvn_refl *rf = &vs->rf; uint32_t fmask = 0, imask = 0;
-    for (int v = 0; v < rf->nv; v++) if (vs->fv_locs >> rf->v[v].loc & 1) {
-        int a = rf->v[v].nvn; MTLVertexFormat f = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
+    const nvn_refl *rf = &vs->rf; uint32_t fmask = 0, imask = 0, umask = 0, smask = 0;
+    for (int v = 0; v < rf->nv; v++) {
+        int a = rf->v[v].nvn, l = rf->v[v].loc, fl = vs->fv_locs >> l & 1; if (a >= 16) continue;
+        // *_I2F on an input the shader declares float (or the variant does): converted in the shader; one declared integer (used only as bits) would need the float's bits, left to the zero fallback
+        if (vfmt_i2f(k->attr[a].fmt) != MTLVertexFormatInvalid) { if (rf->v[v].ct == NVN_CT_FLOAT || fl) { if ((k->attr[a].fmt - 0x51) & 1) smask |= 1u << l; else umask |= 1u << l; if (fl) fmask |= 1u << l; } continue; }
+        if (!fl) continue;
+        MTLVertexFormat f = vfmt(k->attr[a].fmt);
         if (f == MTLVertexFormatInvalid) continue;
-        if (vfmt_int(f)) imask |= 1u << rf->v[v].loc; else fmask |= 1u << rf->v[v].loc;
+        if (vfmt_int(f)) imask |= 1u << l; else fmask |= 1u << l;
     }
-    if (!fmask) return vs;
+    if (!fmask && !umask && !smask) return vs;
     pthread_mutex_lock(&g_fv_mu);
-    if (!vs->fv_tried) { vs->fv_tried = 1; vs->fv = shader_load(vs->fv_key, 0); MLOG("顶点着色器 %s 有浮点输入的绘制：用变体 %s%s", vs->key, vs->fv_key.UTF8String, vs->fv ? "" : "（加载失败）"); }
-    NvShader *r = vs->fv;
-    if (r && imask) {
+    NvShader *r = vs; NSString *name = @(vs->key);
+    if (fmask) {
+        if (!vs->fv_tried) { vs->fv_tried = 1; vs->fv = shader_load(vs->fv_key, 0); MLOG("顶点着色器 %s 有浮点输入的绘制：用变体 %s%s", vs->key, vs->fv_key.UTF8String, vs->fv ? "" : "（加载失败）"); }
+        if (vs->fv) { r = vs->fv; name = vs->fv_key; } else { imask = 0; umask &= ~vs->fv_locs; smask &= ~vs->fv_locs; }
+    } else imask = 0;   // the integer-declared shader takes integer formats as they are
+    if (imask | umask | smask) {
         if (!vs->fv_mix) vs->fv_mix = [NSMutableDictionary dictionary];
-        NvShader *mx = vs->fv_mix[@(imask)];
-        if (!mx) { mx = vs_mixed(r, vs->fv_key, imask); if (mx) { vs->fv_mix[@(imask)] = mx; MLOG("顶点着色器 %s：整数位置 %#x、浮点位置 %#x 混用，现编混合版本", vs->key, imask, fmask); } }
-        if (mx) r = mx;
+        NSString *mk = [NSString stringWithFormat:@"%@/%x/%x/%x", name, imask, umask, smask];
+        id mx = vs->fv_mix[mk];
+        if (!mx) {
+            mx = vs_rewrite(r, name, imask, umask, smask) ?: (id)[NSNull null]; vs->fv_mix[mk] = mx;
+            if (mx == [NSNull null]) MLOG("【红】顶点着色器 %s：位置 %#x 要按整数取再转浮点，%s.metal 缺或编不出，这些输入照旧填 0", vs->key, umask | smask, name.UTF8String);
+            else MLOG("顶点着色器 %s：现编改声明版本（源 %s，按位读的整数位置 %#x，整数转浮点位置 %#x / 有符号 %#x）", vs->key, name.UTF8String, imask, umask, smask);
+        }
+        if (mx != [NSNull null]) r = mx;
     }
     pthread_mutex_unlock(&g_fv_mu);
-    return r ? r : vs;
+    return r;
 }
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -2778,6 +2800,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     for (int v = 0; v < rf->nv; v++) {
         int loc = rf->v[v].loc, a = rf->v[v].nvn;   // Metal slot loc ← NVN attribute a
         MTLVertexFormat vf = a < 16 ? vfmt(k->attr[a].fmt) : MTLVertexFormatInvalid;
+        if (vf == MTLVertexFormatInvalid && a < 16 && vsv->i2f_locs >> loc & 1) vf = vfmt_i2f(k->attr[a].fmt);   // *_I2F with the input re-declared integer (vs_for_formats)
         // When a >= S.nattr, k.attr[a] keeps the 0 from memset, vfmt(0) is Invalid, the same fallback branch is taken and the RED_ONCE condition of fmt being non-0 does not hold.
         if (a < 16 && k->attr[a].fmt && vf == MTLVertexFormatInvalid) RED_ONCE(15, "顶点属性格式 %#x 未映射", k->attr[a].fmt);
         if (vf == MTLVertexFormatInvalid) {
