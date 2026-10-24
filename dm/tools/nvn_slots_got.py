@@ -25,7 +25,7 @@ for i in range(512):
     if t == 0: break
     tags.setdefault(t, v)
 rel = {}
-for k in range(tags[8] // 24):                                   # DT_RELA = 7, DT_RELASZ = 8
+for k in range(tags.get(8, 0) // 24):                            # DT_RELA = 7, DT_RELASZ = 8; a module whose relative relocations are all packed into DT_RELR has neither
     off, info, add = struct.unpack_from('<QQq', d, tags[7] + k * 24)
     if info & 0xffffffff == 1027: rel[off] = add                 # R_AARCH64_RELATIVE
 # DT_RELR (36 / 35, from SDK 20): the addend is in the slot; even entry = start, odd entry = bitmap of the next 63 slots

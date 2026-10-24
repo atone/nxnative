@@ -1308,6 +1308,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 lod = Src(coordType);
             }
 
+            // nxnative: texel offsets read from a register (Maxwell AOFFI / PTP from a non-immediate) are not constants. Upstream put them
+            // into an OpConstantComposite and passed them as ConstOffset / ConstOffsets: invalid SPIR-V, on which SPIRV-Cross throws "nullptr"
+            // (the shader never builds). Constant offsets keep the old form byte for byte; runtime ones use Offset (see the gather below)
+            bool offsetsConst = true;
+
             SpvInstruction AssembleOffsetVector(int count)
             {
                 if (count > 1)
@@ -1321,11 +1326,25 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                     SpvInstruction vectorType = context.TypeVector(context.TypeS32(), count);
 
+                    if (Array.Exists(elems, e => e.Opcode != Op.OpConstant))
+                    {
+                        offsetsConst = false;
+
+                        return context.CompositeConstruct(vectorType, elems);
+                    }
+
                     return context.ConstantComposite(vectorType, elems);
                 }
                 else
                 {
-                    return Src(AggregateType.S32);
+                    SpvInstruction elem = Src(AggregateType.S32);
+
+                    if (elem.Opcode != Op.OpConstant)
+                    {
+                        offsetsConst = false;
+                    }
+
+                    return elem;
                 }
             }
 
@@ -1398,10 +1417,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             if (hasOffset)
             {
-                operandsMask |= ImageOperandsMask.ConstOffset;
+                operandsMask |= offsetsConst ? ImageOperandsMask.ConstOffset : ImageOperandsMask.Offset;
                 operandsList.Add(offsets[0]);
             }
-            else if (hasOffsets)
+            else if (hasOffsets && offsetsConst)
             {
                 operandsMask |= ImageOperandsMask.ConstOffsets;
                 SpvInstruction arrayv2 = context.TypeArray(context.TypeVector(context.TypeS32(), 2), context.Constant(context.TypeU32(), 4));
@@ -1430,6 +1449,25 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             if (intCoords)
             {
                 result = context.ImageFetch(resultType, image, pCoords, operandsMask, operands);
+            }
+            else if (isGather && hasOffsets && !offsetsConst)
+            {
+                // nxnative: ConstOffsets must be constant. Each texel of a four-offset gather is texel (i0, j0) of a gather at that one offset,
+                // which is component w of its result (gather order: i0j1, i1j1, i1j0, i0j0)
+                SpvInstruction[] texels = new SpvInstruction[4];
+
+                for (int index = 0; index < 4; index++)
+                {
+                    SpvInstruction[] gatherOperands = [.. operands, offsets[index]];
+                    ImageOperandsMask gatherMask = operandsMask | ImageOperandsMask.Offset;
+                    SpvInstruction texel4 = isShadow
+                        ? context.ImageDrefGather(resultType, image, pCoords, dRef, gatherMask, gatherOperands)
+                        : context.ImageGather(resultType, image, pCoords, compIdx, gatherMask, gatherOperands);
+
+                    texels[index] = context.CompositeExtract(context.TypeFP32(), texel4, 3);
+                }
+
+                result = context.CompositeConstruct(resultType, texels);
             }
             else if (isGather)
             {

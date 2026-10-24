@@ -2,10 +2,13 @@
 int g_nfail, g_lasterr;
 void front_save_failed(int err) { g_nfail++; g_lasterr = err; }
 
-int g_t_lang = -1;   // Value of the language switch (lang_en in dm_custom.c) in the settings file, changed by the cases in t_fs.c: -1 never tapped / 0 Simplified Chinese / 1 English
-int dm_custom_lang_explicit(void) { return g_t_lang; }
-
-// the loader's module table: h_fs_MountSave picks the save directory by main's build ID (dm.h dm_main_build); the unit test has no modules, so the table is empty
+// the loader's module table (dm.h): the unit test has no modules, so the table is empty
 #include "../dm.h"
 module_t g_mod[MAX_MOD];
 int g_nmod;
+// the guest address space (hle_svc.c): the unit test has none, so every stack is a host stack and the big-stack takeovers run on it directly (hle_bigstack.c)
+#include <stdint.h>
+int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }
+// main's imports (loader.c) and the MiiModel stand-in (hle_mii.c): no main module, no system data
+int dm_main_imports(const char *prefix) { (void)prefix; return 0; }
+int dm_mii_standin(const char *dir) { (void)dir; return 0; }

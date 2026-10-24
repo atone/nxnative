@@ -32,6 +32,9 @@ int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }
 static unsigned pick_tile(uint32_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
+// The automatic block height (no packaged layout): NVN truncates height in blocks × 1.5 / 8 before picking the power of two (found by MacNativeGames; Touchable checked
+//   16 such textures of Rhythm Heaven Groove). Rounding it up, as this file did until then, gave one step more at 6–10, 17–21, 38–42 and 81–85 block rows: Rhythm Heaven
+//   Groove's 672×160 and 1232×160 BC7 textures (40 block rows) need 4 GOBs, not 8 (the calibration screen's beat numbers came out torn); its 112×112, 288×208 and 880×432 agree
 static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
     if (!shift) return 0;
     uint32_t x = unit << (shift - 1);
@@ -48,7 +51,7 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *z = d->depth * 6; *layered = 1; break;       // CUBEMAP_ARRAY
+        case 9: *dpl = 2; *layered = 1; break;                          // CUBEMAP_ARRAY: the depth counts layer-faces, as in OpenGL (DRAGON QUEST XI S: 510 for 85 cubes)
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;
@@ -59,21 +62,36 @@ static void samples_xy(int s, uint32_t *sx, uint32_t *sy) {
     if (s == 2) *sx = 2; else if (s == 4) *sx = *sy = 2; else if (s == 8) { *sx = 4; *sy = 2; }
 }
 
-static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z,
-                             unsigned tileH, unsigned tileD, fmt_t t) {
+// Sparse textures (flag SPARSE, block-linear) are mapped in 64 KB tiles: one row of blocks, 128 GOBs / (block height × block depth) wide. A level at least one tile wide, high and deep
+// is laid out with its width padded to whole tiles, so it fills whole tiles; the levels from the first smaller one on form the mip tail, packed as usual from there, and the
+// storage is whole tiles, 64 KB aligned. Monster Hunter Rise's streamed textures come pre-swizzled that way in its files and are placed at the level offsets the host reports: laid out unpadded,
+// its 1024×1024 ASTC 6×6 textures (48 GOBs wide instead of 43, level 1 at 0x90000 instead of 0x81000) read 2,183 all-zero blocks in level 0 and 3,043 in level 1, which ASTC
+// decodes as its error colour (magenta clothes)
+enum { SPARSE_TILE = 0x10000 };
+static int sparse_of(const nvn_texdesc *d) { return (d->flags & 0x20) && !(d->flags & 0x10) && d->target != 10; }
+// Offset of level `level` from the start of its layer, and the GOB columns it is laid out with (*gobs, may be NULL)
+static uint64_t level_walk(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z,
+                           unsigned tileH, unsigned tileD, fmt_t t, uint32_t *gobs) {
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
+    uint32_t tw = 128u >> (tileH + tileD); if (!tw) tw = 1;   // GOB columns of a 64 KB tile
+    int tiled = sparse_of(d);   // still in a sparse texture's tiled levels
     uint64_t off = 0;
-    for (unsigned i = 0; i < level; i++) {
+    for (unsigned i = 0;; i++) {
         uint32_t lw = blk(mip(w * sx, i), t.bw);
         uint32_t lh = dpl >= 2 ? blk(mip(h * sy, i), t.bh) : 1;
         uint32_t ld = dpl >= 3 ? mip(z, i) : 1;
         uint32_t lwb = lw * t.bpb;
         unsigned th = adj_tile(tileH, 8, lh), td = adj_tile(tileD, 1, ld);
         uint32_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
-        uint32_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
-        off += (uint64_t)wt * ht * dt << (9 + th + td);
+        tiled = tiled && lwb >= tw * 64 && lh >= 8u << tileH && ld >= 1u << tileD;
+        if (tiled) wg = (wg + tw - 1) / tw * tw;
+        if (i == level) { if (gobs) *gobs = wg; return off; }
+        uint32_t ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
+        off += (uint64_t)wg * ht * dt << (9 + th + td);
     }
-    return off;
+}
+static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z, unsigned tileH, unsigned tileD, fmt_t t) {
+    return level_walk(d, level, dpl, w, h, z, tileH, tileD, t, 0);
 }
 
 void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
@@ -94,11 +112,12 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         return;
     }
     unsigned tileH = 0, tileD = 0;
-    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8); }
+    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile(ah * 3 / 16); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;
     uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileH, tileD, t);
+    if (sparse_of(d)) ls = (ls + SPARSE_TILE - 1) & ~(uint64_t)(SPARSE_TILE - 1);
     if (layered) {                                                    // Layer size is aligned to the block
         uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
         while (th && hh <= (8u << (th - 1))) th--;
@@ -108,7 +127,7 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     }
     o->layer_size = ls;
     o->size = layered ? ls * z : ls;
-    o->align = 512;
+    o->align = sparse_of(d) ? SPARSE_TILE : 512;
 }
 
 uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
@@ -118,6 +137,16 @@ uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     if (!t.bpb || (d->flags & 0x10) || d->target == 10) return 0;
     nvn_texlayout L; nvn_tex_layout(d, &L);
     return level_offset(d, level, dpl, w, h, z, L.tileH, L.tileD, t);
+}
+
+uint32_t nvn_tex_level_gobs(const nvn_texdesc *d, unsigned level) {
+    fmt_t t = fmt_of(d->format);
+    unsigned dpl; int layered; uint32_t w, h, z, g = 0;
+    shape(d, &dpl, &layered, &w, &h, &z);
+    if (!t.bpb || (d->flags & 0x10) || d->target == 10) return 0;
+    nvn_texlayout L; nvn_tex_layout(d, &L);
+    level_walk(d, level, dpl, w, h, z, L.tileH, L.tileD, t, &g);
+    return g;
 }
 
 void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {
@@ -130,4 +159,14 @@ void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, 
     uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
     *tileH = adj_tile(L.tileH, 8, lh);
     *tileD = adj_tile(L.tileD, 1, ld);
+}
+
+int nvn_tbuf_rows(uint64_t n, uint32_t bpb, uint32_t align, uint32_t *w, uint32_t *h, uint32_t *row) {
+    if (!n || !bpb) return 0;
+    if (!align) align = 1;
+    *w = n < NVN_TBUF_ROW ? (uint32_t)n : NVN_TBUF_ROW;
+    *h = (uint32_t)((n + NVN_TBUF_ROW - 1) / NVN_TBUF_ROW);
+    uint64_t r = (uint64_t)*w * bpb; r = (r + align - 1) / align * align;
+    *row = (uint32_t)r;
+    return *h == 1 || r == (uint64_t)NVN_TBUF_ROW * bpb;   // several rows must lie back to back, as the wrapped address assumes
 }

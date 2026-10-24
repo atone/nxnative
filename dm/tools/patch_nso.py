@@ -5,27 +5,44 @@
 #   mrs tpidr_el0       → read thread slot KTLS; msr tpidr_el0 → write KTLS
 #   mrs tpidrro_el0     → read thread slot KTLR (Horizon ThreadLocalRegion pointer)
 #   svc #n, mrs cntpct_el0 → host gate (gate address taken from thread slot KGATE; once in C, gates.tsv is looked up by return point)
-#   Registered cuts (CUTS, restricted by NSO build ID): before rewriting, the original bytes are asserted one by one and any mismatch aborts; results are listed in <name>.cuts.tsv
-#   Registered observation gates (OBS, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
+#   sub sp, sp, xN      → xN rounded up to 16 first (Apple's kernel faults on a misaligned sp, Horizon does not; site_sp_align)
+#   spin wait loops     → a copy whose back-edges pass a spin gate (the host yields there; a busy poll costs nothing on the Switch, see "Spin waits")
+#   Registered cuts (CUTS of the patch files, restricted by NSO build ID, see "Registered patches"): before rewriting, the original bytes are asserted one by one and any mismatch aborts; results are listed in <name>.cuts.tsv
+#   Registered observation gates (OBS of the patch files, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
 # The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
 # Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv
-import struct, re, sys, os
+import struct, re, sys, os, glob, types, importlib.util
 from itertools import combinations
 import lz4.block
 from capstone import *
+from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
+import nso_asm
+from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared with the per-build patch files
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 d = open(src, 'rb').read()
-assert d[:4] == b'NSO0'
-flags = struct.unpack_from('<I', d, 0xc)[0]
-segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
-bss = struct.unpack_from('<I', d, 0x3c)[0]
-csz = struct.unpack_from('<III', d, 0x60)
+if d[0x10:0x14] == b'NRO0':
+    # An NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code): the file is the image itself, each segment stored at its memory offset
+    # and uncompressed; +0x20 text, +0x28 ro, +0x30 data as {offset, size}, +0x38 bss size, +0x40 the build ID. Rewritten as an NSO of the same layout would be
+    flags, csz = 0, [struct.unpack_from('<II', d, 0x20 + 8 * i)[1] for i in range(3)]
+    segs = [(o, o, sz) for o, sz in (struct.unpack_from('<II', d, 0x20 + 8 * i) for i in range(3))]
+    bss = struct.unpack_from('<I', d, 0x38)[0]
+else:
+    assert d[:4] == b'NSO0'
+    flags = struct.unpack_from('<I', d, 0xc)[0]
+    segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
+    bss = struct.unpack_from('<I', d, 0x3c)[0]
+    csz = struct.unpack_from('<III', d, 0x60)
 # Every jump between the patch area and the code is a B (±128 MB). A patch area appended after the image (with bss) cannot reach the code when it would start beyond 112 MB (leaving 16 MB for the patch area): Metroid Dread's main has about 1.8 GB of bss (the engine's static heap); Engage's main starts its patch area at about 103 MB and keeps it after the image.
 # The patch area then sits FRONT bytes before the module base (PATCH_OFF is negative), and the output file holds only text + ro + data (FILE_IMAGE_LEN) followed by the patch area; the loader supplies zero pages for bss and the key page (IMAGE_SIZE is the whole image).
 # The key page stays after bss (the patch area reaches it through ADRP, ±4 GB). Modules below the limit produce output byte-identical to before
 NEAR_PATCH_OFF = ((((segs[2][1] + segs[2][2] + bss + 0x3FFF) & ~0x3FFF) + 0x4000 + 0xFFFF) & ~0xFFFF)   # where an appended patch area would start (as in the else branch below)
 FAR, FRONT = NEAR_PATCH_OFF > 0x7000000, 0x2000000
+# A text segment that ends within 32 MB of the ±128 MB reach (Monster Hunter Rise: 125.3 MB of text) puts the patch area right before the base instead. Its stubs follow the sites in address
+# order, so the last site's stub ends up about as far from it as the text is long. The first pass tries the gap that keeps every site in reach; when the patch area does not fit there
+# (Monster Hunter Rise: 3.6 MB), the rewriter runs again with exactly the size it needs (DM_PATCH_FRONT, set only by that rerun) and B() checks every branch
+BIG_TEXT = FAR and segs[0][2] + FRONT > 0x8000000 - 0x10000
+if BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - segs[0][2]) & ~0xFFFF
 IMG = bytearray(segs[2][1] + segs[2][2] + (0 if FAR else bss))
 for i, (fo, mo, sz) in enumerate(segs):
     raw = d[fo:fo + csz[i]]
@@ -42,223 +59,33 @@ else:
     IMG.extend(bytes(0x4000))
     PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
 
-# ---- Registered cuts: {NSO build ID: [(offset, original bytes, new bytes, reason)]} ----
-# Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
-# Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
-CUTS = {
-  # Super Mario Bros. Wonder v0 main
-  'cd6e42aee7934f4d8393cd43893ae25e': [
-    # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin
-    # (PlayerYoshiAnm uses 99%). On the host, Model/NpcCommonerA.bfres in the opening course Course900 is about 0x70 bytes short: after the model resource's last GPU chunk (MatBlock,
-    # 0x9000 bytes, 4 KB aligned, main+0x4290c0) is placed, its 0x598-byte descriptor does not fit, the GPU allocation fails → a buffer is built on a null memory pool → null read crash at main+0x106f5c8.
-    # Where this differs from hardware is not known (every allocation size before this block is determined by game code and data); for now every resource heap gets +16 KB.
-    (0x1e62fc, 'e00317aa', 'e0124091', '资源堆尺寸：mov x0,x23 → add x0,x23,#0x4000（ExpHeap::create 的尺寸参数 +16 KB）'),
-  ],
-  # Super Mario Bros. Wonder 1.2.1 (v327680) main: same as above. Location carried over from v0 by dm/tools/nso_fnmap.py (containing function 0x1e603c → 0x1cf6f0 identical after address masking, ExpHeap::create 0x4aac38 → 0x4c4a18)
-  'ff773e90972d544eb79406eaa65396d5': [
-    (0x1cf9b0, 'e00317aa', 'e0124091', '资源堆尺寸：mov x0,x23 → add x0,x23,#0x4000（ExpHeap::create 的尺寸参数 +16 KB）'),
-  ],
-  'db0507f36b84200ac05f75d76ed5026f': [
-    # (Placed in the base rewrite shared by all build outputs): game video memory allocator budget 260 MB → 512 MB
-    (0x8524c4, '0808a2d2', '0800a4d2', '显存分配器初始化配置：mov x8,#0x10400000（260 MB）→ mov x8,#0x20000000（512 MB），随后 movk #0xa0,lsl48 与 str [sp,#0x238] 不变；'
-     '原预算下内部分辨率 > 约 345 万像素时（2736x1260 过、2864x1240 崩）渲染目标放不下，main+0x174b018 返回空、main+0x17417a4 读空崩溃；'
-     '只是显存预算，不进游戏逻辑：cvd5 逐拍对拍在 1600x900 与 2868x1320 两档均一致'),
-    (0x1979bc, 'e8a79f1a', 'e8d79f1a', '离线放行窗口：读存档设置键（0x1d53e80 处字串）的上次在线时刻，'
-     '「当前时刻 − 上次在线 < 0x0009356907420000 ns（= 30 天）」置位 [x20+0x2c]；lt→gt'),
-    (0x5b14dc, 'e8a79f1a', 'e8d79f1a', '调 0xddab50（缓冲区 [x10+0x138]+x25、剩余长度、回调 0x527d50、表 0x209cdb8、9 项）返回值 <1 置位，'
-     '为真时走 0x5b14f8 分支；lt→gt（业务含义未从字串定出）'),
-    (0x5f3184, 'e8a79f1a', 'e8d79f1a', '数据表 [0x2d64a18+idx*16] → +0xf90 记录（0x1fc 字节）+0x4c 下标 → +0xfd0 记录（0x128 字节）+0xf1 有符号字节 <0 置位，'
-     '与（w26>0x24）相与后作第 4 参传下游；lt→gt（业务含义未从字串定出）'),
-    (0x1d53e80, '55736572204c617374204f6e6c696e6500', '566f6963654c616e677561676500000000',
-     '只读字串 "User Last Online" → "VoiceLanguage"：第 1 处改读一个必定存在的设置键，「上次在线」取到小数值，差值恒超 30 天，配合 gt 恒放行'),
-    # Product cut: the opening Logo and the 「按 A 开始」(Press A to Start) page are cut, and startup goes straight to the main menu (the loading screen is kept)
-    (0x8019ec, '280f0034', 'e8feff34', '前端引导首次进入分支：cbz w8,#0x801bd0（LogoMenuPanel → Logo 视频 → 标题页）改为 cbz w8,#0x8019c8'
-     '（落到直达路径的 0x23e5e0(1) → 0xb156a0 进主菜单；跳过 0x8019bc 起置联机模式 [0x2d7badc]=1 的两条，联机模式保持启动初值 0 = 离线，'
-     '不触发 0x80ec44 的联网检查、断网弹窗与回标题页）；r4 版目标 0x8019bc 会置联机模式 1，实测仍回标题页并弹断网框'),
-    # Cuts for host-native implementations (host only: the ground-truth emulator does not apply them, Ryujinx does not know host call numbers from 0x80 up; equivalence is proven by per-block decoding matching 5511/5511)
-    (0x1b0ee60, 'fc6fbaa9fa6701a9', '011000d4c0035fd6', 'TACT BLTE 块 zlib 解码入口（DecodeZlib）→ svc #0x80 ; ret：宿主用 libdeflate 实现'
-     '（hle_tact.c，调用号登记在 hle.h SVC_HOST_TACT_ZLIB）；改写器先打剪口再扫描，svc #0x80 自动成为宿主门，门块保存恢复 x30，ret 回原调用者', '仅宿主'),
-    # Hook points for host test switches (host only): by default the host forwards as is, behavior unchanged
-    (0x5d3a88, 'a27a0194', '211000d4', '收包泵 0x5d3960 投递客户端命令包的调用点 bl 0x632510 → svc #0x81：宿主缺省以原参数原样调用 0x632510（返回值调用方不用）；'
-     'DM_C2S_REPLAY 时丢弃客户端自发命令、改由拍入口按文件注入（diag.c，调用号登记在 hle.h SVC_HOST_C2S_DELIVER）', '仅宿主'),
-    (0x5d39c8, 'ba750194', '411000d4', '收包泵 0x5d3960 投递系统类消息的调用点 bl 0x6310b0 → svc #0x82：宿主缺省以原参数原样调用 0x6310b0（返回值调用方不用）；'
-     'DM_C2S_REPLAY 时，回放文件首拍起丢弃宿主客户端自发的系统类消息（之前的加入消息放行），改由拍入口按文件注入（diag.c，调用号登记在 hle.h SVC_HOST_C2S_SYS）', '仅宿主'),
-    # Screen aspect (host only, together with the resolution parameter slots in PARAMS below): output resolution cap {u32 width, u32 height}, read or written at only three places in resolution selection
-    # (0xe12e28 / 0xe10d70 read: if the selected value's width or height exceeds the cap, no switch is made; 0xe12f54 writes it to the selected value after initialization finishes selecting); initial value 1920x1080 → 4096x2160, so that a width widened to the screen aspect can pass
-    (0x211da30, '8007000038040000', '0010000070080000', '输出分辨率上限初值 1920x1080 → 4096x2160（数据段）：宿主按屏幕比例给的宽度（如 iPhone 19.5:9 的 1956x900）'
-     '须不超上限才会被选中；Mac 前端仍给原值 1600x900 / 1280x720，行为不变', '仅宿主'),
-    # The width that the operation-mode notification handler (0xe10d30) gives to the "window size changed" event: original code mov w9,#0x740; and x9,x25,x9 -- the compiler knew the width could only be 1280 (0x500) / 1600 (0x640),
-    # and optimized "take the low 32 bits" into & (0x500|0x640). The KRES0 / KRES1 parameter slots replaced those two constants, but this derived mask was not changed along with them: 2868 & 0x740 = 768, 2296 & 0x740 = 64
-    # (after switching docked / handheld while running, the output width was 64 / 768; the iOS overheating downgrade takes exactly this path). Changed to take the low 32 bits directly: same result for the original game's two widths, correct for any width
-    (0xe10e48, '09e880522903098a', 'e903192a1f2003d5', '运行模式通知发窗口尺寸事件的宽度：mov w9,#0x740; and x9,x25,x9 → mov w9,w25; nop（取低 32 位，不再用原版两档宽度推出的常数掩码）', '仅宿主'),
-    (0xe12e88, '09e880528902098a', 'e903142a1f2003d5', '启动初始化选分辨率（0xe12d70）同一处掩码：mov w9,#0x740; and x9,x20,x9 → mov w9,w20; nop（structck 参数门下游掩码检查查出；启动时事件接收对象通常未建，平时不显形）', '仅宿主'),
-    # Product cut (reproducing the exclusion list item "classic picture toggle"): the two state writes of the classic picture toggle 0xb15d60 → nop.
-    # The picture transition state starts at 0x2dc0758 (+4 start, +8 target, +0xc progress; 1.0 = new picture); in the whole program the only writers are 0x852280 (startup init writes 1), 0x85cb20 (force back to the new picture, writes 1),
-    # 0x856be0 (writes only +0xc) and 0xb15d60 (when not in a run, or when the run version is 1 / 2, flips the target between 0 / 1 according to the current coefficient) -- the last is the only place that can push the target toward 0;
-    # the callers 0x36a5a0 / 0x4035e8 / 0xc25f48 / 0xc2725c are all toggle actions (the video option LegacyGraphicsMode, the character creation page's ToggleLegacy, the console version's ClassicToggle and the key LegacyToggle all converge here).
-    # What is cut is two plain stores, containing no calls: the list of synchronization primitives and external side effects of the cut part is empty (the cut rule). The hint branch for run version 3 in a run (from 0xb15e2c) is untouched
-    (0xb15e20, '0281002d', '1f2003d5', '经典画面切换写起点 / 目标（stp s2, s0, [x8, #4]）→ nop：目标恒为 1.0（新画面）'),
-    (0xb15e24, '1f0d00b9', '1f2003d5', '经典画面切换清进度（str wzr, [x8, #0xc]）→ nop'),
-    # Widescreen (host only, together with the KASPECT aspect ratio cap in PARAMS): the cap in UI canvas width = min(screen width, 4560 = 2160 × 19/9) is opened up to 0xffff.
-    # In the original game at 16:9 the screen width of 3840 units < 4560, so the result is unchanged; on iPhone 1952x900 the screen width is about 4685 units, which used to be clamped to 4560, leaving about 26 pixels on each side
-    (0xb1a660, '083a8252', 'e8ff9f52', '界面画布宽上限 mov w8, #4560 → mov w8, #0xffff（画布宽 = 屏宽）', '仅宿主'),
-    # (Reverted: the cuts 0x3172f8 / 0x3173e4 for "SetLanguage 0x317298 clear + reload string tables" in place since r13 / r15 (originally set up to exclude languages other than Simplified Chinese),
-    # reverted because of the English version -- switching language in the original game relies on this reload.)
-    # Product cut: the loading of string table A (legacy, 0x2d70ff0 / 0x2d71010) is skipped as a whole. The load function 0x7f64f0(w0 = whether to load legacy)
-    # branches at the tbz w23 at 0x7f669c: when not loading, the success flag is set to 1 (0x7f6800), the same result as all 17 strings-legacy/*.json loading successfully.
-    # No-reader proof: of the 128 functions in the whole program that reference table A, 124 also read the table-select flag [0x2d71098] and select the table by "flag = 0 → table B (0x2d71030 / 0x2d71050)"
-    # (e.g. the csel at 0x13b7d8); the other 4 are the table's own static constructor 0x7f8f80, load 0x7f64f0, table insert 0x7f72e0 and clear 0x7f5b60. The flag's only write site 0xb1bcf4
-    # writes !obj[0xb9], and obj[0xb9] is obtained by comparing the picture transition state 0x2dc0758 with 1.0 -- r14 already cut the classic picture toggle, the only thing that can push the target away from 1.0; the flag is in .bss
-    # (initial value 0), and the probe at 0xb1bcfc over the whole r15 cvd5 run hit 0 times (the write site never executed) ⇒ only table B is read throughout. The cut tree = 17 single-file loads via 0x7f72e0; same as the supplementary proof of
-    # the language reload cut above (the same 0xdf67f0 read transaction, paired, no external waiters)
-    (0x7f669c, '370b0036', '59000014', '字符串表装载 tbz w23, #0（是否装 legacy 表 A）→ b 0x7f6800：表 A 无读者（选表标志恒 0 → 表 B），整段 17 个 legacy 文件不装'),
-    # The per-block decode call sites of the two streaming segment read paths of Granny segment decoding (BitKnit2): by default the host forwards as is to 0x11f4af0 (the replacement hook point of pre-decode plan A, hle_granny.c)
-    (0x11f02dc, '05120094', '611000d4', '段读取 0x11f0110 逐块解码 bl 0x11f4af0(ctx, 块, 长度) → svc #0x83：宿主缺省以原参数原样调用并回填 w0（hle.h SVC_HOST_GRANNY_A）', '仅宿主'),
-    # Drop light (host only): the item's appearance definition path lookup bl 0xa14dc4(resource manager, unit, x8 output string) → svc #0x87: the host forwards the call as is,
-    # and for items in mode 3 / 5 (on the ground / dropping) repoints the path by rule to the lit variant in the overlay (dm_dropfilter.c svc_ground_asset; hle.h SVC_HOST_GROUND_ASSET)
-    # Tier-one drop sound (host only): fetching the drop sound on landing bl 0x470c20(item, &trigger frame) → svc #0x88: the host forwards the call as is, and tier-one items get a notification sound instead (dm_dropfilter.c svc_drop_sound)
-    (0x468f2c, '3d1f0094', '011100d4', '物品落地取掉落音调用点 bl 0x470c20 → svc #0x88：宿主原样代调后按规则把一档物品的掉落音换成提示音（其余原样）', '仅宿主'),
-    (0x8fa590, '0d6a0494', 'e11000d4', '物品外观路径调用点 bl 0xa14dc4 → svc #0x87：宿主原样代调后按规则改指地上物品的带光变体（存储 / 穿戴 / 腰带 / 镶嵌不碰）', '仅宿主'),
-    # Run-entry spawn point (entering a run lands next to the town waypoint, with the corpse in the same place as the player; host only): the player join function 0x5d7f70 fetches a spawn point once for the player and once for the corpse, both via bl 0x5596c0(data version, act, level, cell type 0, &x, &y, unit size)
-    # → svc #0x8a (player) / #0x8b (corpse): the host forwards the call as is; when the run is entered in town it instead picks the point by "waypoint cell 13 + a fixed safe distance", and the player, corpse and mercenary are placed in one go by the original game (the player is no longer moved by a level change on tick 2, and the corpse no longer stays at the original spawn point) (dm_townwp.c svc_join_spawn)
-    (0x5d8040, 'a005fe97', '411100d4', '玩家进局取出生点调用点 bl 0x5596c0 → svc #0x8a：宿主原样代调，进局在城镇时出生点换成小站旁（hle.h SVC_HOST_JOIN_SPAWN）', '仅宿主'),
-    (0x5d8400, 'b004fe97', '611100d4', '进局给尸体取落点调用点 bl 0x5596c0 → svc #0x8b：同上，尸体与人取同一个点（hle.h SVC_HOST_JOIN_CORPSE）', '仅宿主'),
-    (0x11f0914, '77100094', '811000d4', '段读取 0x11f07d0 逐块解码 bl 0x11f4af0(ctx, 块, 长度) → svc #0x84：同上（hle.h SVC_HOST_GRANNY_B）', '仅宿主'),
-  ],
-  # Fire Emblem Engage 2.0.0 (v327680) sdk: AddressRegionManager node area 0x3fe00000 (about 1 GB) → 0x3e00000 (62 MB).
-  # The constructor (sdk+0x346420) carves the node area out of the start of the alias region (a unit heap of 0x30-byte nodes, mapped only as used) before AllocateAddressRegion hands out regions.
-  # The hardware alias region is 64 GB, so the 1 GB does not matter there; the host's alias region is only 5.375 GB (iOS caps a single reservation at 6 GB), and after StandardAllocator's 3.14 GB block (1 GB aligned)
-  # Unity's low-level virtual allocator (main+0x9aa0f4 → AllocateAddressRegion) had only about 1.2 GB left; about 357 s into the prologue battle it got no region → returned 0 → null write crash at main+0x9a4664.
-  # 62 MB holds about 1.35 million nodes (a few hundred regions are live in measurements). Both movs must change together: +0x346430 sets the node area limit, +0x3464cc registers it as an occupied region.
-  # Fire Emblem Engage 2.0.0 (v327680) main: run the game's own 60 fps path (vertical sync count always 1).
-  # The game's time class App.GameTime picks a vertical sync count per scene (Slow = 2, i.e. 30 fps: system, movies, demos, combat cutscenes, the hub; Normal is 1 only when GameConfig.IsPerformance)
-  # and hands it to Unity through GameTime.SetVsyncCount(int) (QualitySettings.vSyncCount → NVN present interval). About 96 pieces of per-frame logic (cameras, map cursor, unit actors, menu scrolling and cursors, hub camera, minigames)
-  # step by GameTime.VsyncFixedCount (= vSyncCount, how many 60 Hz ticks each frame advances): with a count of 2 and 60 frames on screen they all run twice as fast, with a count of 1 at 60 fps they are right.
-  # The real-time VsyncDeltaCount / VsyncDeltaTime (hub character movement, fishing, dragon ride and so on, about 120 places) do not depend on the frame rate.
-  # The cut is in Unity's managed wrapper QualitySettings.set_vSyncCount (main+0x32f92c0): both paths use w19 as the argument, mov w19,w0 → mov w19,#1,
-  # so every caller (GameTime, QualitySettingsStack.PopImpl, XRSystem) can only set 1; the read side (get_vSyncCount) follows at 1 and the game stays consistent. No code calls SetQualityLevel.
-  '8c08b9719e085f91847b5e0f935d9488': [
-    (0x32f92d4, 'f303002a', '33008052', 'QualitySettings.set_vSyncCount 包装：参数 mov w19,w0 → mov w19,#1（游戏自己的 60 帧路径）', '仅宿主'),
-  ],
-  # The Legend of Zelda: Breath of the Wild 1.9.0 (v1114112) main: 60 fps. The main loop of sead::GameFrameworkNx (main+0x112660c) runs a dynamic interval (framework +0x267 = 1):
-  # every frame it computes how many vsyncs the last frame needed (rounded up), clamped to [2, max 3] (the max comes from the interval controller +0xc, constructed at main+0x1126c04); it steps up after 3 overrunning frames in a row,
-  # steps down one level every 6 frames until 2, and hands the result through setWaitVsyncInterval (vtable +0x130, main+0x11269b8) to presentation (nvnWindowSetPresentInterval).
-  # The game logic time step follows it: ksys::VFR is initialized with a base interval of 2 (constant 2 at main+0x127e740 → VFR::init main+0x151d2d0), and every frame VFR::updateInterval (main+0x151d3d0,
-  # called at main+0xcf9ad4 / main+0x1281044) takes the framework's current interval (vtable +0x138); the frame ratio = current interval / 2 -- at interval 1 each frame advances half a 30 fps tick and the game speed stays the same;
-  # when it struggles and steps back to 2 / 3 the ratio is 1 / 1.5, again at the same speed. So only the floor changes from 2 to 1: the lower bound of the candidate interval (two places), the step-down target recorded when stepping up, max(candidate, 3) - 1 → max(candidate, 2) - 1,
-  # and stepping down stops at < 3 → < 2. On hardware the same logic starting from 1 would also be 60 fps (falling back to 30 by itself when the GPU cannot keep up)
-  'cd57b23fa4bbad65803d9788c01821ee': [
-    (0x112670c, '6041201e', '4041201e', '动态间隔候选下限：fmov s0,s11（2.0）→ fmov s0,s10（1.0）', '仅宿主'),
-    (0x1126710, '7f0b0071', '7f070071', '动态间隔候选下限：cmp w27,#2 → cmp w27,#1', '仅宿主'),
-    (0x112665c, '78008052', '58008052', '升档时记的降档目标 max(候选, w24) − 1：mov w24,#3 → mov w24,#2', '仅宿主'),
-    (0x1126748, '1f0d0071', '1f090071', '升档时记的降档目标：cmp w8,#3 → cmp w8,#2', '仅宿主'),
-    (0x1126794, '3f0d0071', '3f090071', '降档到 < 3 停 → 到 < 2 停：cmp w9,#3 → cmp w9,#2', '仅宿主'),
-  ],
-  '56ec24747ec9e7f19b3efb062483a19d': [
-    (0x346430, '08fca752', '087ca052', 'AddressRegionManager 构造：节点区上限 mov w8,#0x3fe00000 → mov w8,#0x3e00000', '仅宿主'),
-    (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager 构造：节点区登记为已占区域的长度 mov w9,#0x3fe00000 → mov w9,#0x3e00000', '仅宿主'),
-  ],
-  # The Legend of Zelda: Link's Awakening 1.1.0 (v131072) main: the physics step (main+0x15730, main thread) rebuilds each world's PhysX completion task in place
-  # (a PxLightCpuTask at world+0xc8) and passes it to simulate. A worker runs it (main+0x10ccf80: fetchResults, world+0x1d8 done = 1, notify, unlock) and then calls its
-  # release (main+0x10cd070), which calls the task's own destructor: vtable back to the PxLightCpuTask base, mTm = 0 (main+0x10cced0). At 30 fps the game steps twice
-  # per frame (step, wait, step, wait); the unlock hands the world's mutex to the woken main thread, and when the worker is descheduled there the main thread's
-  # next step rebuilds the task before the late destructor runs, which then wipes the new task. The next simulation's NpSceneCompletion::release reads its mTm = 0:
-  # crash at main+0x10ccf28 (lr main+0x13c236c; seen on the iPhone and in 2 of 5 Mac runs, in every Mac run under CPU load). On the Switch the release follows the
-  # unlock within nanoseconds. The release becomes a plain ret: the destructor only resets the vtable and mTm (no resources), the step rebuilds every field, and this
-  # release is used by this one vtable (main+0x1c51308 slot 7) only
-  '909e904af78ac1b8deefe97ab2ccdb51': [
-    (0x10cd070, '080040f9', 'c0035fd6', '物理完成任务 release（自调析构）：ldr x8,[x0] → ret（不再析构；步进函数每步原地重建）', '仅宿主'),
-  ],
-}
-# ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
-# the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
-
-OBS = {
-  # Metroid Dread 2.1.0 main: the movie player posts "link / unlink holders" requests into the dispatcher thread's request ring (main+0x222cc8) and goes on without waiting for them (after an unlink it frees the wrapper object and builds a new one in place).
-  # On hardware the dispatcher thread (priority 30, core 0 only) preempts the main thread (priority 44, core 0) at once and finishes first; the host waits for the ring to empty after each post (hle_movie.c movie_ring_wait). The gates sit on the add x22, x22, #8 after the bl
-  '646761f643afebb379edd5e6a5151af2': [
-    (0x2247a4, 19, '910022d6', '挂等待项请求投完（main+0x224728 循环，x19 = 请求环）：等分发线程处理完；原指令 add x22, x22, #8 | link request posted (loop at main+0x224728, x19 = request ring): wait for the dispatcher; orig add x22, x22, #8'),
-    (0x2248e4, 20, '910022d6', '摘等待项请求投完（main+0x224868 循环，x19 = 请求环）：等分发线程处理完再释放对象；原指令 add x22, x22, #8 | unlink request posted (loop at main+0x224868, x19 = request ring): wait for the dispatcher before the object is freed; orig add x22, x22, #8'),
-  ],
-  'db0507f36b84200ac05f75d76ed5026f': [
-    (0xb1dc60, 1, 'd10603ff', 'UI 消息总线虚函数实现入口（x1 = 消息 {u64 类型哈希, u64 动作哈希, char* 面板名, …}）：'
-     'DM_UIMSG 消息流与 DM_BOOTPROF 启动分段的唯一来源；原指令 sub sp, sp, #0x180'),
-    (0x5d3bc0, 2, 'd10503ff', '服务端拍入口（x0 = 游戏对象 G）：DM_TICKS 逐拍 6 格状态哈希（dm/verify/tick_state_format.md，与真值 swtick.py 同一采集点）；'
-     '原指令 sub sp, sp, #0x140'),
-    (0x6e5b40, 3, 'd10103ff', '客户端命令分派入口 (G, 单位, 包, 长度)：DM_C2S_LOG 命令包序列（dm/verify/command_packet_format.md，与真值同一采集点）；'
-     '原指令 sub sp, sp, #0x40'),
-    (0x6310b0, 4, 'a9bb67fc', '系统类客户端消息处理入口 (buf = u32 客户端号 + 包, 包长)：包号 ≥ 0x67（加入 / 心跳 0x6d / 0x6f 等），收包泵先抽干此队列；'
-     'DM_C2S_LOG 记为 "q":"sys"；原指令 stp x28, x25, [sp, #-0x50]!'),
-    (0x317298, 5, 'd10183ff', 'SetLanguage 入口（x1 → u32 新语言号，语言名表 main+0x20ae478）：配合上方语言重载剪口，宿主断言新语言为 zhCN；'
-     '原指令 sub sp, sp, #0x60'),
-]}
+# ---- Registered patches of particular builds, keyed by NSO build ID: dm/tools/sdk_patches.py (Nintendo SDK module builds, which several games can ship) and dm/games/<id>/patches.py
+# (a game's own modules: its profile's builds). Every file is loaded, whatever the game, so a module gets the patches of its build wherever it comes from; a build ID claimed twice stops the rewrite.
+# A file may define:
+#   CUTS = {build ID: [(offset, original bytes, new bytes, reason)]}: before rewriting, the original bytes are asserted one by one and any mismatch aborts (listed in <name>.cuts.tsv)
+#   OBS = {build ID: [(offset, number, original instruction word, reason)]}: observation gates. Numbers match OBS_* in the host's hle.h; the original instruction must be position
+#     independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns
+#   FRAME_STEP = {build ID: function(ctx)}: the frame step stubs of a main ("Frame step in whole vsyncs" below)
+PATCH_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
+def load_patches():
+    tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}}, {}
+    for n, path in enumerate(PATCH_FILES):
+        spec = importlib.util.spec_from_file_location(f'patches_{n}', path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        for kind, table in tables.items():
+            for bid, v in getattr(m, kind, {}).items():
+                assert bid not in table, f'{kind} of build {bid} in both {where[kind, bid]} and {path}'
+                table[bid], where[kind, bid] = v, path
+    return tables, where
+PATCHES, PATCH_WHERE = load_patches()
 BUILD_ID = d[0x40:0x50].hex()
-# Build-time product rules: the old original-resource / comparison domain is unchanged by default; the touchscreen version is issued separately as a new version, and guest code is not written at runtime.
-RULESET = os.environ.get('DM_RULESET', 'native')
-assert RULESET in ('native', 'touch-run-v4'), f'未知规则域 {RULESET}'
-RULE_BUILD = 'db0507f36b84200ac05f75d76ed5026f'
-RULE_RUN = RULESET == 'touch-run-v4' and NAME == 'main'
-if RULE_RUN:
-    import hashlib
-    assert BUILD_ID == RULE_BUILD, f'Run规则构建号不符 {BUILD_ID}'
-    RULE_ORIG_SHA = hashlib.sha256(IMG).hexdigest()
-cuts = list(CUTS.get(BUILD_ID, []))
-# The touchscreen rule domain by default also carries the host-private gates; the rule gate check can turn them off explicitly, keeping the same packaging entry point and rule domain.
-PRIVATE_GATES = os.environ.get("DM_PRIVATE_GATES", "1") != "0"
-PRIVATE_AIM = RULE_RUN and PRIVATE_GATES
-if PRIVATE_AIM:
-    cuts.append((0x2faf04, 'fde7fe97', 'c11000d4',
-      'skill-aim-v1-private: skill ground direction call only; svc86 delegates original2b4ef8 then sampled-right/original rotation+grid; zero/nonplayer/non-skill retain original; busy/town/skill/server untouched', '仅宿主'))
-if RULE_RUN:
-    # Directional light shadow map edge length (quality level 1, 0x168a520 fills +0x48 → creates the 2-layer array 0x1697394): 2100 → 1024. Authorization: "visually indistinguishable is enough";
-    # on the second Mac, 108 images + 16 consecutive frames: for camp / wilderness / combat, at every level down to 1024 the FLIP cannot be told apart from the noise of a rerun with the same settings, and the change between adjacent frames in shadow regions is 0.71 → 0.75; on a real device the two shadow maps total about 0.7–1.4 ms / frame.
-    # The shadow size constants and the viewport that the game passes to the shader change with the same config value (verified by dump). The native rule domain (the Mac gate check against the original game's ground truth) stays at 2100
-    SHADOW_SIDE = 1024
-    movz_w14 = lambda n: struct.pack('<I', 0x52800000 | (n << 5) | 14).hex()   # movz w14,#n -- the bytes are computed by an expression, not written by hand (a hand calculation came out as #32768, and the shadow map allocation of 32768² failed, crashing at startup)
-    cuts.append((0x168a580, movz_w14(2100), movz_w14(SHADOW_SIDE), f'阴影图边长 mov w14,#2100 → mov w14,#{SHADOW_SIDE}（档位 1）', '仅宿主'))
-if RULE_RUN:
-    # Purely informational system notifications do not swallow the function key: the controller version's notification panel handler 0x3d84a0, on "action 9 (PLUS) pressed", executes the confirm action carried by the notification and swallows the key (meant for "press PLUS on a level-up notification to go straight to the skill tree").
-    # The confirm action carried by a system notification (event queue class 12, 0xab5c08; e.g. 「游戏难度设为 N…」(game difficulty set to N...) after changing the difficulty) only closes itself, and the result is that during the 10 seconds the notification stays up the first press of the red cross does nothing (reproduced on a real device + Mac).
-    # Fix: system notifications carry no confirm action (the category hash is stored as 0); notifications without a confirm action do not handle PLUS (they take the original function's "forward to child widgets" exit 0x3d880c) and close by themselves at notificationSeconds. Notifications with a confirm action are unchanged
-    cbz_x8 = lambda at, to: struct.pack('<I', 0xB4000008 | (((to - at) >> 2) & 0x7ffff) << 5).hex()
-    str_x19_178 = lambda rt: struct.pack('<I', 0xF9000000 | (0x178 // 8) << 10 | 19 << 5 | rt).hex()
-    cuts.append((0xab5c28, str_x19_178(8), str_x19_178(31), '系统通知的确认动作类别 str x8,[x19,#0x178] → str xzr（不带确认动作）', '仅宿主'))
-    cuts.append((0x3d853c, cbz_x8(0x3d853c, 0x3d8560), cbz_x8(0x3d853c, 0x3d880c), '通知面板：确认动作类别为空 → 不处理 PLUS', '仅宿主'))
-    cuts.append((0x3d8544, cbz_x8(0x3d8544, 0x3d8560), cbz_x8(0x3d8544, 0x3d880c), '通知面板：确认动作哈希为空 → 不处理 PLUS', '仅宿主'))
-if RULE_RUN:
-    # The skill tooltip appears beside the skill tree and does not cover the tree: the skill tree panel's per-frame update (0xc356b0) calls the tooltip entry 0xb16660 at 0xc35fd4, with position argument x1 = the icon's absolute coordinates (low 32 bits x, high 32 bits y + 3);
-    # the controller version's tooltip expands against the icon's lower right, which on a touchscreen covers exactly the few skills around the finger. The bfxil x1,x8,#0,#32 at 0xc35fb0 is a no-op that copies the low half of x1 back into x1 (x8 = x1),
-    # and is replaced with movk x1,#3000: the x coordinate is put off screen, and the tooltip entry's own clamp-back (0xb0d560, by TooltipsPanel's screenEdgePadding) snaps it to the right safe-area edge; the y coordinate is untouched
-    cuts.append((0xc35fb0, struct.pack('<I', 0xB3407D01).hex(), struct.pack('<I', 0xF2800000 | 3000 << 5 | 1).hex(), '技能说明框横坐标给到屏幕外，由原回夹贴右边（不盖技能树）', '仅宿主'))
-if RULE_RUN and PRIVATE_GATES:
-    # Only stamina eligibility / movement selection / walk-run preference are registered; direction, real magnitude, legal mode and the zero-axis branch are not changed.
-    # The type0 guard for the two generic cost / selector points is in the small native trampoline below; non-player keeps the original behavior.
-    run_words = [
-        (0x2c620c, 0xb90e511f, 0x52800029, '偏好初始化：mov w9,1（x8仍为2d20000）'),
-        (0x2c6210, 0xd00152c8, 0xb90e5109, '偏好初始化：str w9,[x8,e50]；替代同页重复adrp，保原x8'),
-        (0x369a90, 0xd100c3ff, None, '客户端RunOff入口尾跳原RunOn；保其player0/合法mode/环境门'),
-        (0x369980, 0x340006a0, 0xd503201f, '客户端RunOn仅取消既有player0门之后的零精力拒绝'),
-        (0x2b2c74, 0x340000a0, 0xd503201f, '控制器d29资格仅取消stat10零值限制；幅度比较与停杆保原'),
-        (0x2b2dc0, 0x3900031f, 0xd503201f, '控制器d29仅取消stat10零值清除；幅度归一化保原'),
-        (0x2b30fc, 0x0a090101, 0x52800021, '已通过合法动作/零轴门的移动编码选择位固定Run；幅度不改'),
-        (0x2b3104, 0x2a1f03e1, 0x52800021, '无用户走跑偏好时亦固定Run编码位；方向/幅度不改'),
-        (0x6dc2c4, 0x1a880502, 0x52800062, 'server42合法移动请求固定Run3，原type0/死亡/锁定/幅度/方向门保留'),
-        (0x6dce90, 0x340000e0, 0xd503201f, 'server49仅取消既有player0/mode2门之后的零精力拒绝'),
-        (0x6dcec0, 0xa9bf7bfd, None, 'server4A入口尾跳原49；长度/type0/mode门保留'),
-    ]
-    for off, old, new, why in run_words:
-        if new is None:
-            target = 0x369900 if off == 0x369a90 else 0x6dce50
-            new = 0x14000000 | (((target - off) >> 2) & 0x3ffffff)
-        cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), 'touch-run-v4：' + why))
-cuts = [c if len(c) == 5 else (*c, '全') for c in cuts]          # 5th item is the scope: 全 (all) | 仅宿主 (host only) (仅宿主 = not applied by the ground-truth emulator)
-for off, ob, nb, why, scope in cuts:
+cuts = list(PATCHES['CUTS'].get(BUILD_ID, []))
+for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
-    assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'剪口原字节不符 {off:#x}：{bytes(IMG[off:off + len(ob)]).hex()}'
+    assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     IMG[off:off + len(nb)] = nb
 # Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
-KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511, 'KRES0': 506, 'KRES1': 507, 'KASPECT': 505, 'KASPECTUI': 504}   # KRES*: resolution parameter slots; KASPECT: picture aspect ratio cap (see PARAMS)
-KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
+KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511}
+KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
 
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
 patch = bytearray(); fix = []; gates = []; stats = {}
@@ -274,33 +101,7 @@ def emit_key_addr(reg, kind):
 def emit_slot_addr(base, key_reg, kind):
     emit_key_addr(key_reg, kind); emit(ADDR(base, base, key_reg))
 
-# ---- Encoders ----
-def B(frm, to):
-    off = to - frm; assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0
-    return 0x14000000 | ((off >> 2) & 0x3FFFFFF)
-def STP(t, t2, n, off): return 0xA9000000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
-def LDP(t, t2, n, off): return 0xA9400000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
-def STP_PRE(t, t2, n, off): return 0xA9800000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
-def LDP_POST(t, t2, n, off): return 0xA8C00000 | (((off // 8) & 0x7F) << 15) | (t2 << 10) | (n << 5) | t
-def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   # stur xt,[xn,#off] (off may be negative)
-def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
-def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
-def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
-def ADRP(dd, pc, target):
-    imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
-    return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd
-def ADDI(dd, n, imm12, sh=0): return 0x91000000 | (sh << 22) | (imm12 << 10) | (n << 5) | dd
-def ADDR(dd, n, m): return 0x8B000000 | (m << 16) | (n << 5) | dd
-def SUBI(dd, n, imm12, sh=0): return 0xD1000000 | (sh << 22) | (imm12 << 10) | (n << 5) | dd
-def BR(n): return 0xD61F0000 | (n << 5)
-def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xzr)
-def BEQ(frm, to):
-    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
-    return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
-def BRK(imm): return 0xD4200000 | ((imm & 0xFFFF) << 5)
-def BLR(n): return 0xD63F0000 | (n << 5)
-NOP = 0xD503201F
+# ---- Encoders: dm/tools/nso_asm.py (imported above) ----
 
 def dis(w, addr):
     l = list(md.disasm(struct.pack('<I', w), addr)); assert len(l) == 1, hex(w)
@@ -365,6 +166,16 @@ def site_sp(ins):
     emit(ADDI(T, 31, 0))             # mov T, sp (in add immediate, 31 is sp)
     emit(subst(ins, S))
     emit(LDP(S, T, T, -16)); emit(B(here(), ins.address + 4))
+    return start
+
+def site_sp_align(ins, n):
+    """sub sp, sp, xN (no shift): Horizon leaves stack alignment checking off for user code, Apple's kernel does not, so an sp that is not 16-byte aligned faults (SIGBUS) at the next sp-based access.
+    Paper Mario: The Thousand-Year Door's script call bridges (main+0x17c140 and five more beside it, hand-written) reserve the callee's stack arguments as their sizes add up (4 for one int)
+    and give the area back with add sp, sp, xN: the callee's first stp faulted. xN is rounded up to 16 first, which the add then gives back too. Compiled code keeps such sizes 16-aligned, so
+    there it changes nothing; of the 22 games' modules on hand only Paper Mario's main has the form"""
+    start = here()
+    emit(ADDI(n, n, 15)); emit(0x927CEC00 | n << 5 | n)   # add xN, xN, #15; and xN, xN, #~15
+    emit(struct.unpack('<I', ins.bytes)[0]); emit(B(here(), ins.address + 4))
     return start
 
 def site_cond(ins):
@@ -441,6 +252,12 @@ def site_blr(ins):
     emit(ADRP(30, here(), ret)); emit(ADDI(30, 30, ret & 0xFFF)); emit(BR(16))
     return start
 
+def site_br_call(ins):
+    """br x18 as an indirect tail call (tail_call): x16 = guest x18, br x16. As at site_blr, x16 / x17 are intra-procedure-call temporaries at a call, and x30 keeps the caller's return address"""
+    start = here()
+    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(BR(16))
+    return start
+
 def site_sysreg_read(ins, kind):
     """mrs xN, tpidr_el0 / tpidrro_el0 → xN = thread slot value."""
     N = ins.bytes[0] & 31
@@ -463,9 +280,8 @@ def site_tpidr_write(ins):
 
 def emit_gate_call():
     """Common section of a gate block (right after stp x29,x30,[sp,#-16]! and before blr x30): x30 = the gate address in thread slot KGATE.
-        Fetching the slot through the key page needs a second register to be borrowed; x29 is borrowed and then immediately restored from the stack: the x29 saved by _dm_gate must be the guest's original value --
-        the host identifies the caller by [x29+8] (skill binding observation gate 6, private aiming gate svc86), and the crash backtrace also walks the x29 chain
-        (since r24 plan C it was borrowed and not returned, the x29 the host got was the slot offset from the key page, and skill icons fell back to placeholder text)."""
+        Fetching the slot through the key page needs a second register to be borrowed; x29 is borrowed and then immediately restored from the stack: the x29 saved by _dm_gate must be
+        the guest's original value, since the crash backtrace walks the x29 chain."""
     emit(MRS_TPIDRRO(30)); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
 
 def site_gate(ins, kind, arg):
@@ -485,7 +301,7 @@ def site_obs(off, oid, word):
         The first half of the gate block is word-for-word isomorphic with site_gate; the host only reads registers and does not modify them (the x0–x8 written back by dm_gate are the original values)."""
     ins = dis(word, off)
     assert ins.mnemonic not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') and not ins.mnemonic.startswith('b.') \
-        and not (ins.mnemonic.startswith('ldr') and '[' not in ins.op_str) and not has18(ins), f'观测门原指令不可搬 {off:#x} {ins.mnemonic} {ins.op_str}'
+        and not (ins.mnemonic.startswith('ldr') and '[' not in ins.op_str) and not has18(ins), f'observation gate original instruction cannot be relocated {off:#x} {ins.mnemonic} {ins.op_str}'
     start = here()
     emit(STP_PRE(29, 30, 31, -16))
     emit_gate_call()
@@ -507,10 +323,19 @@ def find_windows(insl):
         j = i
         while j < len(insl) and insl[j].mnemonic not in EXCL_ST: j += 1
         if j >= len(insl) or j - i >= 16: continue
+        # Another exclusive load before the store: this one has no store of its own (a retry block, see retry_block); spanning both would merge two sequences
+        # (Tears of the Kingdom main+0x5a4674: ldxr w18; cmp; b.eq <stxr of 0x5a427c>; ...; 0x5a469c: ldxr w13; and; stxr; cbnz, a loop other code branches to)
+        if any(x.mnemonic in EXCL_LD for x in insl[i + 1:j]): continue
         if j + 1 < len(insl) and insl[j + 1].mnemonic in ('cbz', 'cbnz'): j += 1
         seg = insl[i:j + 1]
         if any(has18(x) for x in seg): out.append(seg)
     return out
+
+def window_adrp(x, S, pc):
+    """An adrp inside a window, copied to pc: the same page from the copy's address (x18 as its stand-in S). Pikmin 4 1.1.1 main+0x43da140 (Unreal Engine 4.26.2): ldaxr x9,[x9]; cmp; b.ne;
+    adrp x10 + add x10 (the same address again for the store); mov x18,x26; stlxr w9,x8,[x10]; …; cbnz w9"""
+    rd = num(x.reg_name(x.operands[0].reg))
+    return ADRP(S if rd == 18 else rd, pc, x.operands[1].imm)
 
 def site_window(seg):
     used = set()
@@ -537,6 +362,7 @@ def site_window(seg):
             if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
             else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
             dd = dis(w, pc); assert dd.operands[-1].imm == newt and dd.mnemonic == m
+        elif m == 'adrp': w = window_adrp(x, S, copy0 + 4 * k)
         else:
             assert m not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret') and not (m == 'ldr' and '[' not in x.op_str), hex(x.address)
         words.append(w)
@@ -544,6 +370,58 @@ def site_window(seg):
     for t in [hi] + ex_targets:   # fall-through first
         emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
     return start, lo, hi
+
+def retry_block(insl, k, wseg):
+    """The branch insl[k] lands in the middle of window wseg. Accepted only when it ends an out-of-line retry block that re-enters the window at its store-exclusive:
+    an exclusive load, then instructions that do not branch, then this branch. Tears of the Kingdom main+0x18598: ldxr w17,[x10]; cmp w15,w17; b.eq 0x181fc,
+    where 0x181fc is the stxr w17,w18,[x10] of the window 0x181ec..0x18200, whose failed stxr branches back to 0x18598 (same shape at 0x185e8 → 0x18244).
+    Returns (the retry block, the window from that store on), or None"""
+    t = insl[k].operands[-1].imm
+    tail = [y for y in wseg if y.address >= t]
+    if not tail or tail[0].mnemonic not in EXCL_ST: return None
+    for p in range(k - 1, max(-1, k - 8), -1):
+        q = insl[p]
+        if q.mnemonic in EXCL_LD: return insl[p:k + 1], tail
+        if q.mnemonic in ('b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') or q.mnemonic.startswith('b.') or q.mnemonic in EXCL_ST: return None
+    return None
+
+def site_retry_window(parts):
+    """A retry block (see retry_block) gets a patch copy of its own: it cannot jump into the window's copy, because the x18 stand-in would have to be loaded
+    between its exclusive load and the store. parts = [(retry block, its fall-through), (window from the store on, the window's fall-through)] are copied one
+    after the other under one prologue, each followed by its fall-through stub; branches to any copied instruction (between the parts, and the failed store's
+    branch back to the retry block's head) stay inside the copy, every other target leaves through an exit stub as in site_window"""
+    used = set()
+    for seg, _ in parts:
+        for x in seg: used |= regs_in(x)
+    S, T = pick(used)
+    start = here()
+    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    pos, at = {}, here()
+    for seg, _ in parts:
+        for x in seg: pos[x.address] = at; at += 4
+        at += 16
+    exits, ex_targets = at, []
+    for seg, ft in parts:
+        for x in seg:
+            w = struct.unpack('<I', x.bytes)[0]
+            if has18(x): w = subst(x, S)
+            m, pc = x.mnemonic, here()
+            if m in ('cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'):
+                tgt = x.operands[-1].imm
+                if tgt not in pos and tgt not in ex_targets: ex_targets.append(tgt)
+                newt = pos[tgt] if tgt in pos else exits + 16 * ex_targets.index(tgt)
+                off = (newt - pc) >> 2
+                if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
+                else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
+                dd = dis(w, pc); assert dd.operands[-1].imm == newt and dd.mnemonic == m
+            elif m == 'adrp': w = window_adrp(x, S, pc)
+            else:
+                assert m not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret') and not (m == 'ldr' and '[' not in x.op_str), hex(x.address)
+            emit(w)
+        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), ft)); emit(NOP)
+    for t in ex_targets:
+        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
+    return start
 
 # ---- Function boundaries (eh_frame_hdr) ----
 m0 = struct.unpack_from('<I', IMG, 4)[0]
@@ -568,9 +446,38 @@ for _ in range(nfde):
 starts = sorted(x for x in starts if x < TEXT_END)
 
 # ---- Linear scan to find all rewrite points (not relying on register read/write reports) ----
+# Data blocks in the text (nso_code.py: Absolum's main starts with 1.7 MB of them) are not code: words there that read as rewrite sites are left alone
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nso_code
+DATA_BLOCKS = nso_code.data_blocks(IMG, TEXT_END, md)
+CODE_RANGES = list(zip([0] + [e for _, e in DATA_BLOCKS], [s for s, _ in DATA_BLOCKS] + [TEXT_END]))
+md_lite = Cs(CS_ARCH_ARM64, CS_MODE_ARM)   # no details: the x18 scan reads only the operand text
+R18 = re.compile(r'\b[xw]18\b')
+def x18_words(lo, hi):
+    """offsets in [lo, hi) of the instructions whose operands name x18 / w18 (as has18). Decoded 16 KB at a time without details, going on after a word capstone cannot decode:
+    a third of the time of decoding one word at a time with details (Paper Mario: The Thousand-Year Door main, 437 sites in 300,000 words either way)"""
+    out, a = set(), lo
+    while a < hi:
+        end = min(hi, a + 0x4000); last = a - 4
+        for addr, size, mn, op in md_lite.disasm_lite(bytes(IMG[a:end]), a):
+            last = addr
+            if R18.search(op): out.add(addr)
+        a = last + 4 if last + 4 >= end else last + 8   # the chunk is done, or the word after the last decoded one is no instruction
+    return out
+x18 = set().union(*(x18_words(s, e) for s, e in CODE_RANGES))
 kinds = {}
-for o in range(0, TEXT_END, 4):
+# Spin wait candidates (see "Spin waits" below): backward direct branches (b, b.cond, cbz / cbnz, tbz / tbnz) at most SPIN_WIN bytes back, by target
+SPIN_WIN, SPIN_TOPS = 512, {0x16, 0x17, 0x54, 0x34, 0x35, 0xB4, 0xB5, 0x36, 0x37, 0xB6, 0xB7}
+spin_cand = {}
+for o in (o for s, e in CODE_RANGES for o in range(s, e, 4)):
     w = struct.unpack_from('<I', IMG, o)[0]
+    if w >> 24 in SPIN_TOPS:
+        t = w >> 24
+        if t in (0x16, 0x17): d = ((w & 0x3FFFFFF) - (1 << 26)) * 4
+        elif t & 0x7E == 0x36: d = (((w >> 5) & 0x3FFF) - (1 << 14)) * 4 if w & 0x40000 else 4
+        elif t == 0x54: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 and not w & 0x10 else 4
+        else: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 else 4
+        if -SPIN_WIN <= d <= 0: spin_cand.setdefault(o + d, []).append(o)
     if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
     if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
     if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
@@ -579,22 +486,51 @@ for o in range(0, TEXT_END, 4):
     if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
     # mrs xN, ctr_el0 (cache type): the Apple kernel does not expose it to user mode (SIGILL); SDK 16's nn::os::FlushDataCache reads it for the cache line size
     if w & 0xFFFFFFE0 == 0xD53B0020: kinds[o] = ('ctr', w & 31); continue
-    for ins in md.disasm(IMG[o:o + 4], o):
-        if has18(ins): kinds[o] = ('x18', None)
+    # sub sp, sp, xN (extended register, LSL #0): sp may end up misaligned, which Horizon allows and Apple's kernel does not (site_sp_align); with x18 it is an x18 site (site_sp)
+    if w & 0xFFE0FFFF == 0xCB2063FF and (w >> 16) & 31 != 18: kinds[o] = ('sp_align', (w >> 16) & 31); continue
+    if o in x18: kinds[o] = ('x18', None)
 
 # Take the instruction table per function, find the windows and jump tables
 import bisect
 def func_of(a):
+    """The function holding a: from the FDE start at or before it to the next one. Code before the first FDE is one function as well, from the end of the data block before it (or the text's
+    start) to the first FDE: FINAL FANTASY RESONANCE 1.0.1 main (Unreal Engine 5.6.1) has no unwind entry before main+0x6a75d4, and each of its sites there used to be a function of one
+    instruction, so the byte jump table at main+0x219234 (adr x18; ldrb w0,[x17,x16]; add x18,x18,x0,lsl #2; br x18) was never seen. Of the 120 modules of 33 games on hand, only one other has x18
+    sites before its first FDE (DRAGON QUEST VII Reimagined main, 110 before +0xb310, none in an exclusive window or a br x18), so every other rewrite is byte-identical"""
     i = bisect.bisect_right(starts, a) - 1
-    return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END) if i >= 0 else (a, a + 4)
-done = set(); windows = []; jumps = {}; tabjumps = {}
-def jump_offsets(insl, j):
+    if i >= 0: return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END)
+    return (max((e for s, e in DATA_BLOCKS if e <= a), default=0), starts[0]) if starts else (a, a + 4)
+done = set(); windows = []; jumps = {}; tabjumps = {}; tailcalls = set(); retries = []
+def check_before_copy(insl, ctx, ld, idx):
+    """The index copied from the checked register before the check, far back (DRAGON QUEST XI S main+0x2dd8cd0: mov w0,w18, then 41 instructions with two other jump tables on x0, then
+    cmp w18,#4; b.hi; ldrsw x18,[x11,x0,lsl #2]; add x18,x18,x11; br x18). Accepted when the cmp and its b.hi come right before the load and the mov is the last writer of the index and of the
+    checked register before them (64 instructions back at most). The compiler checks one register and indexes with the other only when it knows they are equal; blocks in between that branch out
+    and back (main+0x2dd8ce0 → main+0x2dd8cb8) write neither. Tried only when every other form has failed (jump_offsets copy_first), so sites that rewrote before come out the same:
+    the one br x18 of its kind among the 25,508 x18 sites of that main. → the cmp, or None"""
+    k = ctx.index(ld)
+    if k < 2 or ctx[k - 1].mnemonic != 'b.hi' or ctx[k - 2].mnemonic != 'cmp': return None
+    m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', ctx[k - 2].op_str)
+    if not m: return None
+    src, kl = m.group(1), insl.index(ld)
+    def writes(p):   # capstone lists a compare's first operand as written (cmp w18,#4 at main+0x2dd8c30); it only sets the flags
+        return set() if p.mnemonic in ('cmp', 'cmn', 'tst') else {'w' + p.reg_name(r)[1:] for r in p.regs_access()[1]}
+    for q in range(kl - 3, max(0, kl - 64) - 1, -1):
+        p = insl[q]
+        mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
+        if mm and mm.group(1) in idx and mm.group(2) == src: break
+        if writes(p) & (idx | {src}): return None
+    else: return None
+    return ctx[k - 2]
+def jump_offsets(insl, j, copy_first=False, far_base=False):
     """The br x18 is preceded by the offset-table form (Engage main+0x12eec94): cmp w18,#N; b.hi; ldrsw x18,[xB,x18,lsl #2]; add x18,x18,xB.
     The index may be another register, and the bounds check may be on a register copied into it: Link's Awakening's GLSLC (subsdk0+0x1be6e8) has
     sub w0,w18,#0xd1; cmp w0,#0x31; b.hi; ldrsw x18,[x17,x0,lsl #2], its movie module (subsdk1+0xae9a4) cmp w21,#7; b.hi; ...; mov w18,w21; ldrsw x18,[x4,x18,lsl #2].
     The entry may also be loaded into another register and only the add writes x18: Cuphead (Unity 2017.4, main+0x1bb872c) has cmp w17,#7; ldrsw x17,[x15,x17,lsl #2]; add x18,x17,x15
     (found by armyja, GitHub pull request #1).
-    For the table base xB, search back for the nearest writer: it must be add xB,xB,#lo, and the writer before it must be adrp xB. Returns all targets, or None if not recognized"""
+    For the table base xB, search back for the nearest writer: it must be add xB,xB,#lo, and the writer before it must be adrp xB. With far_base, a base that nothing writes in those
+    256 instructions was set further back, and its writer chain is followed to the function's start (table_base far), every target an instruction of the function: ASTRAL CHAIN main+0x6db498
+    and +0x6db70c load bases set 441 and 549 instructions before, x24 in the function's first block and x3 after it, which the loop around their dispatches keeps. A function-wide search
+    for the one adrp + add pair that fits (table_cands, as jump_adr_offsets does) finds two for x3 there, the other a table of its own further on. Returns all targets, or None if not recognized"""
     ctx = insl[max(0, j - 16):j]
     add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
     if not add: return None
@@ -625,6 +561,7 @@ def jump_offsets(insl, j):
                     cmp = p
                 break
             if cmp: break
+    if not cmp and copy_first: cmp = check_before_copy(insl, ctx, ld, idx)
     if not cmp: return None
     n = int(cmp.op_str.split('#')[1], 0) + 1
     k = insl.index(ld); lo = page = None
@@ -634,12 +571,201 @@ def jump_offsets(insl, j):
         if lo is None and p.mnemonic == 'add' and re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', p.op_str): lo = int(p.op_str.split('#')[1], 0); continue
         if lo is not None and p.mnemonic == 'adrp' and p.op_str.startswith(rb + ','): page = p.operands[1].imm
         break
+    else:
+        if lo is None and far_base:   # nothing writes the base in the window
+            tb = table_base(insl, k, rb, far=True)
+            if tb is None: tb = copied_base(insl, k, rb)   # built further back and copied on its way (below)
+            if tb is None or tb + 4 * n > len(IMG): return None
+            t = [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+            fa, fb = insl[0].address, insl[-1].address + 4
+            return t if all(fa <= x < fb and x % 4 == 0 for x in t) else None
+    if page is None and far_base:
+        # The base was built further back and passed through other registers on its way (Super Smash Bros. Ultimate 13.0.5 main+0x2b74458: adrp x7 + add x7,x7,#0x40c
+        # 688 instructions before, then mov x30,x7 ... mov x7,x30 around a loop), so the walk back meets a mov. Follow the copies back to the function's start (copied_base);
+        # every target must be an instruction of this function. A function-wide search for the one adrp + add pair (table_cands) finds two for x7 there, the other a table of its own
+        # further on. Only the last attempt (far_base) gets here, i.e. only a site the rewriter could not handle before
+        tb = copied_base(insl, k, rb)
+        if tb is None or tb + 4 * n > len(IMG): return None
+        t = [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+        fa, fb = insl[0].address, insl[-1].address + 4
+        return t if all(fa <= x < fb and x % 4 == 0 for x in t) else None
     if page is None: return None
     tb = page + lo
     return [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+def table_base(insl, k, rb, far=False):
+    """Address the table-base register rb holds at insl[k]: its writer chain before k must be add rb,rb,#lo after adrp rb (as in jump_offsets); None otherwise.
+    The chain is searched 256 instructions back, or with far to the function's start, through no call when rb is caller-saved (capstone lists only x30 as a call's write; a call between
+    means the code before it in address order is not the path that set rb)"""
+    lo = None
+    for p in reversed(insl[0 if far else max(0, k - 256):k]):
+        if far and p.mnemonic in ('bl', 'blr') and num(rb) <= 18: return None
+        _, w = p.regs_access()
+        if not any(p.reg_name(r) == rb for r in w): continue
+        if lo is None and p.mnemonic == 'add' and re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', p.op_str): lo = int(p.op_str.split('#')[1], 0); continue
+        if lo is not None and p.mnemonic == 'adrp' and p.op_str.startswith(rb + ','): return p.operands[1].imm + lo
+        return None
+    return None
+def copied_base(insl, k, rb):
+    """Address rb holds at insl[k] when it was built by adrp + add and then only copied between registers (mov xD, xS): the writer chain is walked back in address order to the
+    function's start, switching to the source register at each copy, through no call while the register followed is caller-saved; None for any other writer"""
+    canon = {'lr': 'x30', 'fp': 'x29'}   # capstone's reg_name calls x30 lr and x29 fp
+    lo, r = None, canon.get(rb, rb)
+    for p in reversed(insl[:k]):
+        if p.mnemonic in ('bl', 'blr') and num(r) <= 18: return None
+        _, w = p.regs_access()
+        # A write to wN zeroes the upper half of xN too; it is a clobber, never a copy of the 64-bit base.
+        if not any(canon.get(p.reg_name(x), p.reg_name(x)).replace('w', 'x', 1) == r for x in w): continue
+        ops = [canon.get(o, o) for o in p.op_str.split(', ')]
+        if lo is None and p.mnemonic == 'mov' and len(ops) == 2 and ops[0] == r and re.fullmatch(r'x\d+', ops[1]): r = ops[1]; continue
+        if lo is None and p.mnemonic == 'add' and len(ops) == 3 and ops[:2] == [r, r] and re.fullmatch(r'#(0x[0-9a-f]+|\d+)', ops[2]): lo = int(ops[2][1:], 0); continue
+        if lo is not None and p.mnemonic == 'adrp' and ops[0] == r: return p.operands[1].imm + lo
+        return None
+    return None
+def jump_adr_offsets(insl, j):
+    """Entries relative to an adr rather than to the table (Tears of the Kingdom main+0x393bb0): cmp w0,#5; b.hi; ...; adr x18,#L; ldrsw x1,[x17,x0,lsl #2];
+    add x18,x18,x1; br x18 → target = L + entry, with the table base x17 from adrp + add. Tried only where jump_offsets finds nothing. Returns all targets, or None if not recognized"""
+    ctx = insl[max(0, j - 16):j]
+    add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
+    if not add: return None
+    ka = ctx.index(add); ops = add.op_str.split(', ')[1:]
+    for e, a in (ops, ops[::-1]):   # e = the loaded entry, a = the adr base
+        ld = next((p for p in reversed(ctx[:ka]) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{e}, \[x\d+, x\d+, lsl #2\]', p.op_str)), None)
+        wa = next((p for p in reversed(ctx[:ka]) if any(p.reg_name(r) == a for r in p.regs_access()[1])), None)   # the nearest writer of a
+        if not ld or not wa or wa.mnemonic != 'adr': continue
+        tb_reg, ix = re.fullmatch(rf'{e}, \[(x\d+), x(\d+), lsl #2\]', ld.op_str).groups()
+        idx, cmp = {'w' + ix}, None   # the index and the registers copied into it (main+0x596d30: cmp w15,#8; b.hi; mov w16,w15; ...; ldrsw x0,[x17,x16,lsl #2])
+        for p in reversed(ctx[:ctx.index(ld)]):   # walk back from the load to the bounds check
+            m = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
+            if m and m.group(1) in idx: idx.add(m.group(2)); continue
+            m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+            if m and m.group(1) in idx: cmp = p; break
+            if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+        if cmp is None: return None
+        n, at = int(cmp.op_str.split('#')[1], 0) + 1, wa.operands[1].imm
+        def targets(tb): return [at + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None
+        tb = table_base(insl, insl.index(ld), tb_reg)
+        if tb is not None: return targets(tb)
+        # The base register was loaded further away (main+0x5f2a9c: hoisted out of the dispatch block): take every adrp + add pair in the function that builds it,
+        # and accept the table only if exactly one candidate makes every target an instruction of this function
+        fa, fb = insl[0].address, insl[-1].address + 4
+        ok = [tb for tb in table_cands(insl, tb_reg) if (t := targets(tb)) and all(fa <= x < fb and x % 4 == 0 for x in t)]
+        return targets(ok[0]) if len(ok) == 1 else None
+    return None
+def table_cands(insl, rb):
+    """Every address an adrp rb + add rb,rb,#lo pair in the function builds, sorted"""
+    cands = set()
+    for k, p in enumerate(insl):
+        if p.mnemonic != 'adrp' or not p.op_str.startswith(rb + ','): continue
+        q = next((x for x in insl[k + 1:k + 9] if any(x.reg_name(r) == rb for r in x.regs_access()[1])), None)
+        m = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', q.op_str) if q is not None and q.mnemonic == 'add' else None
+        if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
+    return sorted(cands)
+def tail_call(insl, j):
+    """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends the function. Ace Attorney Investigations Collection
+    (Unity 2022.3 IL2CPP) main+0x1d271bc: ldr x18,[x0,#0x18]; ...; ldr x16,[sp]; ...; br x18, a thunk that moves stack arguments and jumps to the method pointer at +0x18"""
+    if j + 1 != len(insl): return False
+    for p in reversed(insl[:j]):
+        if 'x18' not in [p.reg_name(r) for r in p.regs_access()[1]]: continue
+        return p.mnemonic == 'ldr' and bool(re.fullmatch(r'x18, \[(x\d+|sp)(, #(0x[0-9a-f]+|\d+))?\]', p.op_str))
+    return False
+def jump_bytes_far(insl, j):
+    """The byte / halfword table form with its add further back (Octopath Traveler 0 main+0x37f9bc8: adr x18,#L; ldrb w0,[x17,x15]; add x18,x18,x0,lsl #2, then 17 register moves before br x18).
+    Up to 32 instructions back, and x18 must not change between the add and the br. Tried only where the 16-instruction search and the offset forms find nothing. Returns (base, width) or None"""
+    ctx = insl[max(0, j - 32):j]
+    for k in range(len(ctx) - 1, -1, -1):
+        p = ctx[k]
+        if p.mnemonic == 'add' and p.op_str.startswith('x18, x18,') and 'lsl #2' in p.op_str: break
+        if any(p.reg_name(r) == 'x18' for r in p.regs_access()[1]): return None
+    else: return None
+    rn = p.reg_name(p.operands[2].reg); idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
+    base = next((q.operands[1].imm for q in reversed(ctx[:k]) if q.mnemonic == 'adr' and q.op_str.startswith('x18,')), None)
+    ld = next((q for q in reversed(ctx[:k]) if q.mnemonic in ('ldrb', 'ldrsb', 'ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx), None)
+    if base is None or ld is None: return None
+    return base, 256 if ld.mnemonic in ('ldrb', 'ldrsb') else half_count(insl, ld, base) or 65536
+def half_count(insl, ld, base):
+    """Landing pads a halfword table needs (ldrh wE,[xT,xI,lsl #1]; ...; adr x18,#L; add x18,x18,xE,lsl #2; br x18: target = L + 4 × entry). site_br gives every possible entry a pad,
+    65,536 of them (768 KB), whatever the switch's size: Animal Crossing: New Horizons 3.0.3 main has 51 such tables, 40 MB, which put its patch area's end beyond the ±128 MB a B reaches
+    (a B() assertion at its spin waits), and Tears of the Kingdom's main has 11. The table is read as jump_adr_offsets reads one: the index's bounds check (following register copies),
+    then the table base from adrp + add, or the one candidate in the function whose every target is an instruction of it → the largest entry + 1, or None (all 65,536, as before).
+    Byte tables keep their 256 pads (3 KB)"""
+    m = re.fullmatch(r'w\d+, \[(x\d+), [wx](\d+), (?:lsl|uxtw) #1\]', ld.op_str) if ld.mnemonic == 'ldrh' else None
+    if not m: return None
+    tb_reg, k = m.group(1), insl.index(ld)
+    idx, cmp = {'w' + m.group(2)}, None
+    for p in reversed(insl[max(0, k - 32):k]):   # walk back from the load to the bounds check
+        mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
+        if mm and mm.group(1) in idx: idx.add(mm.group(2)); continue
+        mm = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+        if mm and mm.group(1) in idx: cmp = p; break
+        if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+    kc = insl.index(cmp) if cmp is not None else -1
+    if kc < 0 or insl[kc + 1].mnemonic not in ('b.hi', 'b.hs', 'b.cs'): return None   # only a compare that guards the dispatch bounds the index (b.hs: one entry more than needed)
+    n = int(cmp.op_str.split('#')[1], 0) + 1
+    fa, fb = insl[0].address, insl[-1].address + 4
+    def entries(tb): return struct.unpack_from(f'<{n}H', IMG, tb) if 0 <= tb and tb + 2 * n <= len(IMG) else None
+    def fits(e): return e is not None and all(fa <= base + 4 * x < fb for x in e)
+    tb = table_base(insl, k, tb_reg)
+    if tb is None:
+        ok = [c for c in table_cands(insl, tb_reg) if fits(entries(c))]
+        tb = ok[0] if len(ok) == 1 else None
+    e = entries(tb) if tb is not None else None
+    return max(e) + 1 if fits(e) else None
+def disasm_fn(fa, fb):
+    """A function's instructions. Capstone stops at the first word it cannot decode, so go on after it: Monster Hunter Rise main+0x6b34540 is a trap word (0xe7ffdefe)
+    in the middle of a function, and the br x18 jump table after it (main+0x6b346d0) was never seen"""
+    out, a = [], fa
+    while a < fb:
+        l = list(md.disasm(bytes(IMG[a:fb]), a))
+        out += l; a = (l[-1].address + 4 if l else a) + 4
+    return out
+# Text with no unwind entry is one function to func_of. FINAL FANTASY RESONANCE 1.0.1 main (Unreal Engine 5.6.1) has 82 MB of it (main+0x6c5008 to +0x59220c0) beside the 6.65 MB before its
+# first FDE: disassembled with details at once, it took 100 GB of memory and the rewrite never finished on a 16 GB Mac. A function longer than BIG_FN is analysed in pieces of about PIECE
+# bytes, cut only right after an unconditional ret / br / b where no conditional branch and no b within ±PIECE_B crosses: a window, a jump table's context (the bounds check's branch
+# and the table base before it) and a retry block reach each other by fall-through or by such branches, so each lies within one piece. Farther b / bl that cross a cut (calls and
+# tail calls) are checked once every piece is done: none may land inside a window or a retry block (far_into). With b up to 1 MB counted, tail calls between neighbouring functions left
+# 21,385 cut points in that 82 MB and pieces of up to 6.5 MB (about 4 GB while disassembled); with 64 KB, 185,228 points and none over PIECE
+BIG_FN, PIECE, PIECE_B = 0x40000, 0x40000, 0x10000
+def pieces(fa, fb):
+    """[(start, end)] covering [fa, fb), and the far b / bl in it as [(site, target)]"""
+    from array import array
+    n = (fb - fa) // 4
+    w = memoryview(bytes(IMG[fa:fa + 4 * n])).cast('I')
+    cross = array('i', bytes(4 * (n + 2))); far = []
+    for i in range(n):
+        x = w[i]; t = x >> 24
+        if t == 0x54 and not x & 0x10 or t & 0x7E == 0x34: d = (x >> 5) & 0x7FFFF; d -= (d & 0x40000) << 1   # b.cond, cbz / cbnz
+        elif t & 0x7E == 0x36: d = (x >> 5) & 0x3FFF; d -= (d & 0x2000) << 1                                  # tbz / tbnz
+        elif t & 0x7C == 0x14:                                                                                # b, bl
+            d = x & 0x3FFFFFF; d -= (d & 0x2000000) << 1
+            if t & 0x80 or 4 * abs(d) > PIECE_B: far.append((fa + 4 * i, fa + 4 * (i + d))); continue
+        else: continue
+        lo, hi = max(min(i, i + d), -1), min(max(i, i + d), n)   # the branch crosses the cut before instruction k when lo < k <= hi
+        cross[lo + 1] += 1; cross[hi + 1] -= 1
+    cand, c = [], 0
+    for k in range(n):
+        c += cross[k]
+        x = w[k - 1] if k else 0
+        if k and not c and (x & 0xFFFFFC1F in (0xD65F0000, 0xD61F0000) or x >> 26 == 0x05): cand.append(k)   # after ret / br / b, nothing crossing
+    cuts, s = [], 0
+    while s + PIECE // 4 < n:
+        j = bisect.bisect_right(cand, s + PIECE // 4) - 1
+        if j < 0 or cand[j] <= s: j = bisect.bisect_right(cand, s + PIECE // 4)
+        if j >= len(cand): break
+        s = cand[j]; cuts.append(s)
+    b = [0] + cuts + [n]
+    return [(fa + 4 * p, fa + 4 * q) for p, q in zip(b, b[1:])], far
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
+far_into, rmid_all = [], set()
+if any(fb - fa > BIG_FN for fa, fb in funcs):
+    sites18 = sorted(a for a, (k, _) in kinds.items() if k == 'x18'); split = []
+    for fa, fb in funcs:
+        if fb - fa <= BIG_FN: split.append((fa, fb)); continue
+        ps, far = pieces(fa, fb); far_into += far
+        split += [(p, q) for p, q in ps if bisect.bisect_left(sites18, p) < bisect.bisect_left(sites18, q)]   # the pieces that hold x18 sites
+        print(f'function {fa:#x}..{fb:#x} ({(fb - fa) / 2**20:.2f} MB, no unwind entries) analysed in {len(ps)} pieces')
+    funcs = split
 for fa, fb in funcs:
-    insl = list(md.disasm(bytes(IMG[fa:fb]), fa))
+    insl = disasm_fn(fa, fb)
     ws = find_windows(insl)
     for wseg in ws:
         windows.append(wseg); done |= {x.address for x in wseg}
@@ -652,36 +778,58 @@ for fa, fb in funcs:
                 if p.mnemonic == 'adr' and p.op_str.startswith('x18,'): base = p.operands[1].imm; break
             for p in reversed(ctx):
                 if p.mnemonic == 'add' and p.op_str.startswith('x18, x18,') and 'lsl #2' in p.op_str:
-                    idx = num(p.reg_name(p.operands[2].reg))
+                    # capstone names x30 'lr' (and x29 'fp'): Age of Calamity main+0x1382160 indexes with add x18,x18,x30,lsl #2 after ldrb w30,[x14,x12]
+                    rn = p.reg_name(p.operands[2].reg); idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
                     for q in reversed(ctx):
                         if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256
-                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
+                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = half_count(insl, q, base) or 65536 if base else 65536
                         if width: break
                     break
             if not (base and width):
-                tgt = jump_offsets(insl, j)
+                tgt = jump_offsets(insl, j) or jump_adr_offsets(insl, j)
+                if not tgt and tail_call(insl, j): tailcalls.add(ins.address); continue
+                if not tgt and (far := jump_bytes_far(insl, j)): jumps[ins.address] = far; continue
+                if not tgt: tgt = jump_offsets(insl, j, copy_first=True, far_base=True)   # the index copied before the check (check_before_copy) or the base set far back, only where every other form failed
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)
-    # No jump may land in the middle of a window
+    # No jump may land in the middle of a window, except a retry block's branch onto the window's store-exclusive (retry_block), which gets a copy of its own
     inwin = {x.address for wseg in ws for x in wseg}; heads = {wseg[0].address for wseg in ws}
-    for x in insl:
+    rmid = set()
+    for k, x in enumerate(insl):
         if x.mnemonic in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or x.mnemonic.startswith('b.'):
             t = x.operands[-1].imm
-            assert not (t in inwin and t not in heads), f'branch into window {x.address:x}'
+            if t in inwin and t not in heads:
+                wseg = next(w for w in ws if any(y.address == t for y in w))
+                rb = retry_block(insl, k, wseg) if x.mnemonic not in ('b', 'bl') else None
+                assert rb, f'branch into window {x.address:x}'
+                assert not any(y.address in done for y in rb[0]), f'retry block overlaps a window {rb[0][0].address:x}'
+                retries.append([(rb[0], x.address + 4), (rb[1], wseg[-1].address + 4)])
+                done |= {y.address for y in rb[0]}; rmid |= {y.address for y in rb[0][1:]}
+    for x in insl:
+        if x.mnemonic in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or x.mnemonic.startswith('b.'):
+            assert x.operands[-1].imm not in rmid, f'branch into retry block {x.address:x}'
     for a_, tgt in tabjumps.items():
         if fa <= a_ < fb: assert not any(t in inwin and t not in heads for t in tgt), f'jump table target into window {a_:x}'
+    rmid_all |= rmid
+if far_into:   # functions analysed in pieces (pieces above): their far b / bl, and every jump table's targets (a cut may follow a br x18), may not land inside a window or a retry block
+    win_mid = {x.address for wseg in windows for x in wseg[1:]}
+    for at, to in far_into: assert to not in win_mid and to not in rmid_all, f'far branch into a window or retry block {at:x}'
+    for at, tgt in tabjumps.items(): assert not any(t in win_mid or t in rmid_all for t in tgt), f'jump table target into a window or retry block {at:x}'
 
 def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
 for wseg in windows:
     st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
+for parts in retries:
+    st = site_retry_window(parts); stat('retry_window'); put_branch(parts[0][0][0].address, st)
 for a in sorted(kinds):
     if a in done: continue
     k, arg = kinds[a]
     ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
     if k == 'x18':
         m = ins.mnemonic
-        if m == 'br': st = site_br_tab(ins, tabjumps[a]) if a in tabjumps else site_br(ins, *jumps[a]); stat('br')
+        if m == 'br' and a in tailcalls: st = site_br_call(ins); stat('br_call')
+        elif m == 'br': st = site_br_tab(ins, tabjumps[a]) if a in tabjumps else site_br(ins, *jumps[a]); stat('br')
         elif m in ('cbz', 'cbnz', 'tbz', 'tbnz'): st = site_cond(ins); stat('cond')
         elif m in ('adr', 'adrp'): st = site_pcrel(ins); stat('pcrel')
         elif m == 'blr': st = site_blr(ins); stat('blr')
@@ -693,237 +841,297 @@ for a in sorted(kinds):
     elif k == 'tpidr_w': st = site_tpidr_write(ins); stat(k)
     elif k == 'svc': st = site_gate(ins, 'svc', arg); stat(k)
     elif k in ('cntpct', 'cntvct'): st = site_gate(ins, k, arg); stat(k)
+    elif k == 'sp_align': st = site_sp_align(ins, arg); stat(k)
     elif k == 'ctr':   # replaced in place by a constant: DminLine = 4 (64-byte lines); movz xN, #4, lsl #16
         assert arg != 18, f'{a:x} mrs x18, ctr_el0'
         struct.pack_into('<I', IMG, a, 0xD2A00080 | arg); stat(k); continue
     put_branch(a, st)
 
-# Private visual branch; not OBS, 0x85 is a read-only query. Only this experimental build explicitly opts in; the original Qty/children and Update are unchanged.
-if RULE_RUN and PRIVATE_GATES:
-    off, word = 0x3e443c, 0x3969c268
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))  # The w8 query result is used only for cbz; both paths restore the original x8.
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    # cbz w8, nonmatch; NZCV is not changed. On match, restore the registers and then preserve children.
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), 0x3e4460))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), 0x3e4440))
-    gates.append((ret, 'svc', 0x85, off))
-    put_branch(off, start); stat('private_skill_render')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off,start)).hex(),
-                 'private confirmed six HUD only: own image/text skip ->4460; unknown original ->4440; svc85 full800', '仅宿主'))
-elif RULE_RUN:
-    patch.extend(bytes(0x80))
-    stat('private_gates_reserved')
+def scratch_dead(off):
+    """x9–x17 carry nothing at off: from off on, every one of them is written before it is read, up to a bl (a call clobbers them all; DRAGON QUEST VII Reimagined's gate sits on the
+    mov x0, x19 before one) or a ret (none of them carries a result under AAPCS64; Pikmin 4's gate sits on the ldp x29, x30 of an epilogue). Only straight-line code is followed: a branch
+    or a blr before the bl or ret answers no"""
+    written = set()
+    for a in range(off, min(off + 4 * 16, TEXT_END), 4):
+        ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
+        if ins.mnemonic in ('bl', 'ret'): return True
+        if ins.mnemonic in ('b', 'br', 'blr', 'cbz', 'cbnz', 'tbz', 'tbnz') or ins.mnemonic.startswith('b.'): return False
+        rd, wr = regset(ins)
+        if any(9 <= (num(r) or -1) <= 17 and num(r) not in written for r in rd): return False
+        written |= {num(r) for r in wr}
+    return False
 
-obs = list(OBS.get(BUILD_ID, []))
-if RULE_RUN and PRIVATE_GATES:
-    obs.append((0x43ecc8, 6, "b8686953", "private touch-run-v4 PRE-ldr; full800 host ABI"))
-    obs.append((0x1237c60, 8, "d10143ff", "ui world anchor: camera world->screen entry (camera, point, out); host swaps x0 to a copy whose projection is shifted by the UI rect y (iPad UI kept 16:9 inside a taller screen), game camera untouched"))
-    # Freeze the world while a panel is open (host diag.c freeze_tick, off by default, DM_PANEL_FREEZE=1 turns it on). Four entry gates, all of which only swap entry arguments.
-    obs.append((0x5eb2c0, 10, "a9bc5ff8", "server world-sim entry (game G): while frozen the host swaps x0 to a stand-in whose event queue is empty, so no unit / timer callback runs this tick; the real queue is left untouched"))
-    obs.append((0x4b7230, 11, "d10183ff", "client per-unit tick update entry (unit): while frozen the host swaps x0 to a stand-in unit carrying only the skip flag ([+0x124] bit 23), so the function takes its own early-out to the epilogue; all six call sites are inside the client tick simulation 0x461b80 / 0x461e60"))
-    obs.append((0x4b74d0, 12, "f81e0ff3", "client per-unit per-frame update entry (unit): drives model animation / interpolation from the tick fraction; while frozen the host swaps x0 to a stand-in unit (type 9, no render component) so both the callee 0x2a18d0 and this function take their own early-outs"))
-    obs.append((0x2c3c90, 13, "f81c0ff7", "render per-frame entry, called right after the main loop writes the world frame step [0x20cebb8] and world time [0x3114208]: while frozen the host rewrites the step to 0 and the world time to its value at freeze, the same thing the game's own pause path does at 0x2c1574"))
-    obs.append((0xadc434, 14, "d10143ff", "TextBoxWidget text-changed entry (widget): reads the raw text at +0x88 and rebuilds the display; host rewrites +0x88 for strings our item-notes generator annotated with colour codes (TextBoxWidget draws U+E07E as '*'), exact-match table only, everything else untouched"))
-    obs.append((0x442bc0, 15, "a9ba6ffc", "client event-message entry (x0 = packet; byte 1 = event subtype, jump table 0x1da6752): subtype 0x17 = offline difficulty scale changed -> 0x20f91c chat line + system notification; host rewrites byte 1 past the table (default branch, nothing shown) only for 0x17 and only in a rift game (dm_rift.c); otherwise untouched. orig stp x28, x27, [sp, #-0x60]!"))
-    obs.append((0x634000, 16, "d10143ff", "server level change by level number (game, player, level, kind), used by waypoints / portals / quest moves: in a rift game, when the player leaves a rift map for a level that is neither town nor a rift map, the host swaps w2 to the rift's next map so the destination is replaced inside the single native transition"))
-    obs.append((0x711040, 17, "d101c3ff", "server quest event 'monster killed' entry (game, monster, attacker), the only entry (callers 0x7d8550 kill, 0x7ab8dc); in a rift game, for a monster that died on a rift map, the host swaps x1 to a stand-in whose +0xc0 is null so the function takes its own early return (0x711064): bosses in the rift are combat only, no quest state / quest notifications"))
-    obs.append((0x3d84a0, 18, "d10143ff", "NotificationPanel message handler entry (panel, message): on InputMessage / ControllerActionBegin with action id 9 (the menu key) the native handler re-sends the notice callback and marks the message bus consumed, so the first menu press only dismisses the notice. In touch mode the host swaps x1 to a copy of the message whose action id is not 9: the notice stays until it times out and the menu key opens the menu; controller mode keeps the native behaviour"))
-    obs.append((0x2f7664, 7, "6dbb23e9", "touch target rank: candidate compare entry (closure, unit, kind, s0=score); host raises Boss/elite score, native eligibility unchanged"))
+obs = list(PATCHES['OBS'].get(BUILD_ID, []))
 for off, oid, ow, why in obs:
     w = struct.unpack_from('<I', IMG, off)[0]
-    assert f'{w:08x}' == ow, f'观测门原指令不符 {off:#x}：{w:08x}'
+    assert f'{w:08x}' == ow, f'observation gate original instruction mismatch {off:#x}: {w:08x}'
     # Function entries, or the instruction right after a bl, only: dm_gate writes back only x0–x8 / x30, and host C code may modify x9–x17; at entry these carry no values under AAPCS64 (arguments are only in x0–x7 / x8),
-    # and right after a call returns the callee was free to clobber them anyway (x16 / x17 are the veneer registers)
+    # and right after a call returns the callee was free to clobber them anyway (x16 / x17 are the veneer registers). Elsewhere, where the code ahead reads none of them before its next bl
     after_bl = off >= 4 and struct.unpack_from('<I', IMG, off - 4)[0] >> 26 == 0x25
-    assert off in set(starts) or after_bl or (oid == 6 and off == 0x43ecc8), f'private obs point not approved {off:#x}'
-    assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'观测门与改写点冲突 {off:#x}'
+    assert off in set(starts) or after_bl or scratch_dead(off), f'observation gate neither at a function entry, after a bl nor before a call with x9–x17 unread {off:#x}'
+    assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'observation gate conflicts with a rewrite site {off:#x}'
     put_branch(off, site_obs(off, oid, w)); stat('obs')
 
-# Rift exit rerouting (since r36): branch gate 0x89, hooked at the entry of "change level by the exit tile's connection" main+0x7cc1e0(game, player, tile). Its four callers (clicking an exit tile 0x6dbea0,
-# entrance objects 0x6aeaa0 / 0x6b0500, quest 0x7314c0) all call it only after their own checks have passed; the destination is not a level id but the tile's peer room (in the already generated map of the same act), so it cannot be switched to another act.
-# In a rift run the host replaces w2 / w3 with (the rift's next map, 11) and makes x8≠0 → the gate block jumps straight to "change level by level id" 0x634000, same caller, exactly one level change; in all other cases the original instruction is executed and control returns to 0x7cc1e4.
-# The gate block is word-for-word isomorphic with the 0x85 branch gate (structck ⑪ checks it against the hle.h registry); like observation gates 15 / 16 it exists only in build outputs with host-private gates (touch)
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x7cc1e0, 0xd10183ff, 0x634000
-    assert struct.unpack_from('<I', IMG, off)[0] == word and off in set(starts) and tgt in set(starts)
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x89, off))
-    put_branch(off, start); stat('rift_exit')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'rift exit redirect: tile-link level change entry -> host swaps (level, kind) and x8!=0 takes the branch to level-number change 0x634000; otherwise original ->0x7cc1e4; svc89', '仅宿主'))
+# ---- Frame step in whole vsyncs (the mains whose patch file has FRAME_STEP: The Legend of Zelda: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0, Hyrule Warriors: Age of Calamity 1.3.0
+# and Paper Mario: The Thousand-Year Door 1.0.1; host only) ----
+# The games step their game time by a whole number of vsyncs (1/60 s) per frame that their own interval logic picks. With the stubs the host picks it (hle_nvn.c fstep_tick,
+# nvn_fstep.h): the step is the number of vsyncs the host keeps the frame on screen (1 = 60 fps, 2 = 30 when 60 does not hold), plus one while the game is behind real time after
+# a late frame, so motion is even and game time = real time. The steps stay values the games' own logic uses (1 to 3). Age of Calamity's updates are not held by the presents:
+# its stubs run them at the cap, and the host only paces its presents (its patches.py).
+# State page = the page after the key page (zero in the file, read-write in both loaders): +0 float target fps written by the loader (fps_target, DM_FPS_TARGET; 0 = every stub
+# runs the original instructions), +4 TOTK movie flag, +8 double lead (TOTK), +0x10 float render scale (TOTK, BotW), +0x18 double game seconds (TOTK),
+# +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
+# its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). Stub bodies assembled with clang
+# A build's stubs are FRAME_STEP[build ID](ctx) in its patches.py: ctx.here() / ctx.emit(word) assemble into the patch area, ctx.site(offset, original bytes) asserts a site and that it is
+# no rewrite site, ctx.put(offset, words, reason) writes it (listed with the cuts), ctx.state is the state page's offset, and ctx.render_scale = 1 marks a render-scale stub
+FRAME_STEP = PATCHES['FRAME_STEP']
+FS_STATE_OFF = 0
+RENDER_SCALE = 0   # 1 = the build has a render-scale stub (state +0x10): the fixups table says so (RENDER_SCALE), and the iOS launcher offers the setting (dm/games/settings.tsv)
+if BUILD_ID in FRAME_STEP and NAME == 'main':
+    FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
+    assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x40 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
+    def fs_site(off, orig):
+        ob = bytes.fromhex(orig)
+        assert IMG[off:off + len(ob)] == ob, f'frame step original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
+        for o in range(off, off + len(ob), 4):
+            assert o not in kinds and not any(seg[0].address <= o < seg[-1].address + 4 for seg in windows), f'frame step site is a rewrite site {o:#x}'
+    def fs_put(off, words, why):
+        old = bytes(IMG[off:off + 4 * len(words)])
+        for i, w in enumerate(words): struct.pack_into('<I', IMG, off + 4 * i, w)
+        cuts.append((off, old.hex(), bytes(IMG[off:off + 4 * len(words)]).hex(), why)); stat('frame_step')
+if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py)
+    fs = types.SimpleNamespace(here=here, emit=emit, site=fs_site, put=fs_put, state=FS_STATE_OFF, render_scale=0)
+    FRAME_STEP[BUILD_ID](fs); RENDER_SCALE = fs.render_scale
 
-# Current act written to the save while in a Rift (since r38): branch gate 0x8c, hooked at the "read difficulty" instruction main+0x6fa9d0 (ldrb w10,
-# [x21, #0x104]) inside the original save-header writer 0x6fa3e0.
-# The preceding instruction 0x6fa9cc has just loaded "which act the player is currently in" into w9 (ldrb w9, [x24, #0x2e8]); below, 0x6fa9e4 / 0x6fa9e8
-# write it as the difficulty byte 0x80 | act number (.d2s 0x98–0x9a),
-# which decides which town the next session starts in. While the player is in a Rift map the host replaces w9 with 4 (Act 5 → re-enter in Harrogath);
-# only this one value written to the save is changed, the running act number is untouched.
-# A branch gate is used rather than "replace one instruction": structck only recognizes three registered forms, "bl call site", "entry" and "branch
-# gate". The host always sets x8 = 0 (the jump path is never taken);
-# the gate block restores x8, executes the original instruction and returns to 0x6fa9d4; the jump target is set to the return point itself only to
-# satisfy the template (never reached). The gate block is word-for-word identical in structure to 0x85 / 0x89
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x6fa9d0, 0x394412aa, 0x6fa9d4   # An instruction in the middle of a function (same as gate 0x85); it need not be a function entry; the original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8c, off))
-    put_branch(off, start); stat('rift_save_act')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'rift save act: save-header writer, right after it loads the current act into w9 -> host swaps w9 to 4 (act V) while the player is in a rift map; x8 stays 0, original insn runs ->0x6fa9d4; svc8c', '仅宿主'))
-# Extra mercenary equipment slots (since r39): branch gate 0x8d, hooked in the monster-owner branch of the original game's generic placement check main+0x6493a8 at main+0x64a34c (mov w9, w25).
-# This section (0x64a314–0x64a354) lets through only two kinds of items for monster-type owners: 0x574bc0(item, 3 armor) and 0x574bc0(item, 0x25 helm); if neither, it takes the weapon path (by the left / right hand types in monstats), and if that fails too it rejects.
-# The gate is hooked after the "is it a helm" call returns and before cbnz w0: when "the owner is the player's mercenary + highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host changes w0 to 1,
-# taking the same pass path as the helm (the generic checks that follow, such as the body location cell and whether the location is empty, run as usual). The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x85 / 0x89 / 0x8c
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x64a34c, 0x2a1903e9, 0x64a350   # The original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8d, off))
-    put_branch(off, start); stat('merc_slot')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'merc slots: placement check, monster-owner branch right after the helm type test -> host sets w0=1 for ring/amulet/boots/gloves/belt on a hireling (rift best >= 10 for new equips; always on load); x8 stays 0, original insn runs ->0x64a350; svc8d', '仅宿主'))
-# Client half of the extra mercenary equipment slots (same generation as r39): branch gate 0x8e, hooked inside the client's "can the mercenary wear this" function main+0x3bea44(mercenary, item) at main+0x3beb58 (mov x0, x19).
-# This function follows the same rule as the server-side section: if either 0x574bc0(item, 3 armor) or 0x574bc0(item, 0x25 helm) matches it returns 1, and if neither does it takes the weapon path. The item cell widget uses its result to draw the "cannot place" red and
-# to decide whether to place on release -- without changing it, an unlocked new cell still shows red when the right item is dragged over it, and the original game's drop fails (previously the touch layer's fallback called 0x3bed60 directly).
-# The gate is hooked after "mov w1, #0x25" and before the bl of this type check: when "highest rift level cleared ≥ 10 + the item is a belt / boots / gloves / ring / amulet", the host replaces w1 with the item's own type number,
-# so the type check passes naturally and takes the same return-1 path as the helm. The host always sets x8 = 0; the gate block is word-for-word isomorphic with 0x8d
-if RULE_RUN and PRIVATE_GATES:
-    off, word, tgt = 0x3beb58, 0xaa1303e0, 0x3beb5c   # The original instruction does not depend on pc
-    assert struct.unpack_from('<I', IMG, off)[0] == word
-    assert off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows)
-    start = here()
-    emit(STP_PRE(8, 31, 31, -16))
-    emit(STP_PRE(29, 30, 31, -16))
-    emit_gate_call(); emit(BLR(30))
-    ret = here(); emit(LDP_POST(29, 30, 31, 16))
-    emit(0x34000068)
-    emit(LDP_POST(8, 31, 31, 16)); emit(B(here(), tgt))
-    emit(LDP_POST(8, 31, 31, 16)); emit(word); emit(B(here(), off + 4))
-    gates.append((ret, 'svc', 0x8e, off))
-    put_branch(off, start); stat('merc_slot_client')
-    cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
-                 'merc slots (client): hireling can-equip check, between "mov w1,#0x25" and the type test -> host swaps w1 to the item\'s own type for ring/amulet/boots/gloves/belt (rift best >= 10); x8 stays 0, original insn runs ->0x3beb5c; svc8e', '仅宿主'))
-
-# ---- Parameter slots (host only): {NSO build ID: [(offset A, original word A, offset B, original word B, register, key, reason)]}.
-# The two constant-building instructions at the original site are changed so that the first jumps to a parameter trampoline in the patch area and the second is a nop; the trampoline fetches the key page value indirectly and jumps back to just after the first (A+4): when A and B are not adjacent, the original instructions in between execute as usual
-# (it used to jump back to B+4; in the operation-mode notification handler 0xe10d5c/0xe10d60 that skipped adrp x19.. and another trampoline, and switching to handheld crashed immediately; structck ⑩ checks the trampoline exit).
-# xR must not be read or written between A and B (offline assertion: the instructions in between do not contain xR). The host supplies values according to the front end, Mac supplies the original constants → behavior unchanged ----
-PARAMS = {'db0507f36b84200ac05f75d76ed5026f': [
-    (0xe12d8c, 'd280c813', 0xe12d90, 'f2c07093', 19, 'KRES1', '启动初始化：主机模式输出分辨率 1600x900（{u32 宽, u32 高} 打包）'),
-    (0xe12e1c, 'd280a008', 0xe12e20, 'f2c05a08', 8, 'KRES0', '启动初始化：掌机模式输出分辨率 1280x720'),
-    (0xe10d60, 'd280c818', 0xe10d80, 'f2c07098', 24, 'KRES1', '运行模式变化通知（0x1f）处理：主机模式 1600x900'),
-    (0xe10d5c, 'd280a016', 0xe10d74, 'f2c05a16', 22, 'KRES0', '运行模式变化通知（0x1f）处理：掌机模式 1280x720'),
-    # Aspect ratio cap 19:9 (float 0x40071c72): screens wider than 19:9 get black bars on both sides. The host supplies the float bit pattern (low 32 bits) of max(19/9, output width / height);
-    # the original game outputs 16:9 (1600x900 / 1280x720) ⇒ still 19/9, behavior unchanged; iPhone 1952x900 (2.17:1) ⇒ 2.169, black bar width 0
-    (0x1663ee8, '52838e49', 0x1663eec, '72a800e9', 9, 'KASPECTUI', '界面常量缓冲 0x15 号槽 [屏宽, 屏高, 宽高比上限]：界面精灵着色器按它在上限以外画两侧黑柱（带约 20–30 像素向内的柔边，宿主另加余量把柔边推出屏幕）'),
-    (0xb152bc, '52838e48', 0xb152c0, '72a800e8', 8, 'KASPECT', '新画面模式视口：边距 = (屏宽 − 屏高 × 上限) / 2，经 0x85bc90 设居中视口'),
-    (0x23e888, '52838e48', 0x23e88c, '72a800e8', 8, 'KASPECT', '新画面模式坐标钳制（0x23e760）：x 夹进 [边距, 边距 + 屏高 × 上限]，宽屏两侧的指针 / 触摸不再被夹回中间'),
-]}
-params = PARAMS.get(BUILD_ID, [])
-for oa, wa, ob_, wb, r, key, why in params:
-    for o, w0 in ((oa, wa), (ob_, wb)):
-        w = struct.unpack_from('<I', IMG, o)[0]
-        assert f'{w:08x}' == w0, f'参数位原指令不符 {o:#x}：{w:08x}'
-        assert o not in kinds and not any(lo <= o < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'参数位与改写点冲突 {o:#x}'
-    for o in range(oa + 4, ob_, 4):
-        ins = dis(struct.unpack_from('<I', IMG, o)[0], o)
-        assert r not in regs_in(ins), f'参数位中间用到 x{r}：{o:#x} {ins.mnemonic} {ins.op_str}'
-    start = here()
-    tmp = 16 if r != 16 else 17
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(r)); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
-    struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
-
-# The three existing native rule trampolines all use only the dead temporary w8 that is overwritten afterwards, and do not change the w0/stat return, sp or NZCV.
-# 6c6290 is after the original mode3 gate; the Blaze / reference count and data invalidation 6c62dc branches before it and the state update after it are untouched.
-rule_blocks = []
-if RULE_RUN:
-    def run_branch(off, old, body, why):
-        assert struct.unpack_from('<I', IMG, off)[0] == old, f'Run跳板原字不符 {off:#x}'
-        start = here()
-        for word in body(start): emit(word)
-        new = B(off, start)
-        struct.pack_into('<I', IMG, off, new)
-        cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), why, '全'))
-        rule_blocks.append((start, bytes(patch[start - PATCH_OFF:]).hex(), why))
-    def cbz(at, target, r, nonzero=False):
-        delta = target-at; assert delta%4==0 and -(1<<20)<=delta<(1<<20)
-        return (0x35000000 if nonzero else 0x34000000) | (((delta>>2)&0x7ffff)<<5) | r
-    run_branch(0x6c6648, 0x34000060, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c664c),
-        cbz(a+12,a+20,0), B(a+16,0x6c664c), B(a+20,0x6c6654)],
-        'touch-run-v4：Run选择仅player0忽略精力门，非player按原stat返回；w8后继覆盖')
-    run_branch(0x6c6290, 0x710006df, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8,True), B(a+8,0x6c62ec), 0x710006df, B(a+16,0x6c6294)],
-        'touch-run-v4：原合法Run成本段仅player0跳stat10扣除/耗尽降走；非player保持原cmp')
-
-
-    # After the original mode3 / currently controlled unit gate at client4abc60; the actual GetStat has already returned, W0 is preserved, and only for type0 is the STA auto Stop cancelled.
-    run_branch(0x4ac368, 0x35000460, lambda a: [
-        0xb9400268, cbz(a+4,a+12,8), B(a+8,a+16), B(a+12,0x4ac3f4),
-        cbz(a+16,a+24,0), B(a+20,0x4ac3f4), B(a+24,0x4ac36c)],
-        'touch-run-v4：client当前受控Run3仅player0跳STA零值自动Stop；原getter值与真实松杆保留，非player保原门')
-
-
-    # After the original unit null/type5 gate, with w8 still the original unitType; only player request 2 is normalized, and the other original action dispatch / eligibility checks run in full.
-    run_branch(0x6c6580, 0x51000849, lambda a: [
-        cbz(a,a+16,8,True), 0x51000849, cbz(a+8,a+16,9,True),
-        0x52800062, 0x51000849, B(a+20,0x6c6584)],
-        'touch-run-v4：原通用合法移动仅player0请求Walk2规范为Run3，非player与其它请求保原，w8/原资格不改')
+# ---- Spin waits (every module) ----
+# A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the
+# spin costs the game nothing; on the host it takes a whole core from the threads doing the work. Paper Mario: The Thousand-Year Door's gfx::ParallelManager workers
+# (main+0xa8e680, three, pinned at priority 45) poll their job list this way while a batch is pending; on an iPhone Rogueport ran at 24 fps with the three at 94% of a core each.
+# A loop counts as a spin wait only when it provably cannot leave by itself. From its head T, every pass along the region R (the paths from T back to T, within SPIN_WIN bytes
+# after T) runs only loads, register and flag arithmetic, direct branches and barriers: no store, call, SVC, system register or event wait; and no register or flag that is
+# live at T is written in R (no counter, cursor or delay). One exception: an exclusive add of a constant (ld(a)xr; add/sub #k; st(l)xr; cbnz) that every path back to T
+# undoes on the same address (a worker that registers with a job, sees it finished and backs out). Such a pass leaves memory and registers as it found them, so only another
+# thread can end the loop, and a pause there changes only timing. R is copied into the patch area; the original back-edges jump to the copy (no pause on the first pass, so a
+# single retry costs nothing), the copy's back-edges go through a spin gate, which the host takes as a yield with the yield back-off (hle_thread.c dm_spin_wait), and exits
+# from the copy go back to the original code. The gate keeps every register and the flags (entry.S)
+SPIN_PATHS, SPIN_STEPS = 256, 4096   # complete paths back to T; search steps (R itself lies within SPIN_WIN bytes)
+SPIN_LSE = ('ldadd', 'ldclr', 'ldeor', 'ldset', 'ldsmax', 'ldsmin', 'ldumax', 'ldumin')
+SPIN_BAD = {'bl', 'blr', 'br', 'ret', 'eret', 'svc', 'hvc', 'smc', 'brk', 'hlt', 'udf', 'mrs', 'msr', 'sys', 'sysl', 'wfe', 'wfi', 'sev', 'sevl', 'clrex', 'dc', 'ic', 'at',
+            'tlbi', 'drps', 'dcps1', 'dcps2', 'dcps3', 'blraa', 'blrab', 'blraaz', 'blrabz', 'braa', 'brab', 'braaz', 'brabz', 'retaa', 'retab', 'eretaa', 'eretab'}
+spin_dec = {}
+def spin_ins(a):
+    if a not in spin_dec: spin_dec[a] = next(md.disasm(bytes(IMG[a:a + 4]), a), None)
+    return spin_dec[a]
+def spin_norm(n):
+    n = {'fp': 'x29', 'lr': 'x30', 'wsp': 'sp'}.get(n, n)
+    if n in ('wzr', 'xzr'): return None
+    m = re.fullmatch(r'[wx](\d+)', n)
+    if m: return 'x' + m.group(1)
+    m = re.fullmatch(r'[bhsdqv](\d+)', n)
+    return 'v' + m.group(1) if m else n
+def spin_rw(ins):
+    """(registers read, registers written), w / x and the vector views merged. Capstone's own lists are not enough: it lists a compare's first operand as written and the flags
+    as read by cbz / tbz, and leaves out the destination of adds (sdk+0x31033c in Paper Mario: The Thousand-Year Door, adds w9,w9,#8; b.ne: a counted loop). So every register
+    operand counts as well: operand 0 written and the others read, or for a load all of them written (its address registers are in capstone's reads)"""
+    m = ins.mnemonic
+    regs = [spin_norm(ins.reg_name(o.reg)) for o in ins.operands if o.type == ARM64_OP_REG]
+    ops = set(regs) - {None}
+    if m in ('cbz', 'cbnz', 'tbz', 'tbnz'): return ops, set()
+    if m.startswith('b.'): return {'nzcv'}, set()
+    if m == 'b': return set(), set()
+    if m in ('cmp', 'cmn', 'tst', 'fcmp', 'fcmpe'): return ops, {'nzcv'}
+    if m in ('ccmp', 'ccmn', 'fccmp', 'fccmpe'): return ops | {'nzcv'}, {'nzcv'}
+    r, w = ins.regs_access()
+    r, w = {spin_norm(ins.reg_name(x)) for x in r} - {None}, {spin_norm(ins.reg_name(x)) for x in w} - {None}
+    if m.startswith(('ld', 'prfm', 'prfum')): return r, w | ops
+    return r | (set(regs[1:]) - {None}), w | (set(regs[:1]) - {None})
+def spin_kind(ins):
+    """'br' direct branch, 'pc' adr / adrp, 'ok' a load or register / flag arithmetic, None anything else"""
+    if ins is None: return None
+    m = ins.mnemonic
+    if m in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'): return 'br'
+    if m in ('adr', 'adrp'): return 'pc'
+    if m in SPIN_BAD or m.startswith(('st', 'cas', 'swp') + SPIN_LSE): return None
+    mem = any(o.type == ARM64_OP_MEM for o in ins.operands)
+    if m.startswith(('ld', 'prfm', 'prfum')): return 'ok' if mem else None   # no memory operand: a pc-relative literal load
+    return None if mem else 'ok'
+def spin_rmw(a):
+    """ld(a)xr wA,[xN]; add|sub wB,wA,#k; st(l)xr wS,wB,[xN]; cbnz wS,<the load> at a → (xN, ±k, registers written, the four instructions), or None"""
+    l = [spin_ins(a + 4 * i) for i in range(4)]
+    if None in l or l[0].mnemonic not in ('ldxr', 'ldaxr') or l[1].mnemonic not in ('add', 'sub') or l[2].mnemonic not in ('stxr', 'stlxr') or l[3].mnemonic != 'cbnz': return None
+    r = lambda x, i: x.reg_name(x.operands[i].reg)
+    if len(l[1].operands) != 3 or l[1].operands[2].type != ARM64_OP_IMM or 'lsl' in l[1].op_str: return None
+    base = l[0].operands[1].mem
+    if base.disp or base.index or l[2].operands[2].mem.base != base.base or l[2].operands[2].mem.disp: return None
+    if r(l[1], 1) != r(l[0], 0) or r(l[2], 1) != r(l[1], 0) or r(l[3], 0) != r(l[2], 0) or l[3].operands[1].imm != a: return None
+    k = l[1].operands[2].imm * (1 if l[1].mnemonic == 'add' else -1)
+    return spin_norm(l[0].reg_name(base.base)), k, {spin_norm(r(l[0], 0)), spin_norm(r(l[1], 0)), spin_norm(r(l[2], 0))} - {None}, l
+def spin_rebranch(ins, pc, tgt):
+    """the direct branch ins re-encoded at pc with target tgt"""
+    w = struct.unpack('<I', ins.bytes)[0]; off = tgt - pc
+    if ins.mnemonic == 'b': return B(pc, tgt)
+    if ins.mnemonic in ('tbz', 'tbnz'):
+        assert -(1 << 15) <= off < (1 << 15) and off % 4 == 0, f'spin wait tbz out of range {pc:#x}'
+        return (w & ~(0x3FFF << 5)) | (((off >> 2) & 0x3FFF) << 5)
+    assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0, f'spin wait branch out of range {pc:#x}'
+    return (w & ~(0x7FFFF << 5)) | (((off >> 2) & 0x7FFFF) << 5)
+spin_touched = set(kinds) | done | {o for off, oid, ow, why in obs for o in (off,)} | {o for off, ob, nb, why in cuts for o in range(off, off + len(ob) // 2, 4)}
+# Instruction words that end every path through them, told apart by their encoding alone: bl; br / blr / ret; svc / brk; str / strb / strh and the vector str (unsigned offset;
+# unscaled, pre / post-index; register offset); stp / stnp; ldadd and the other LSE atomics. Exclusive stores are left to the full check (the exclusive add), and so are the pre /
+# post-index loads: a seqlock read in SDK 15's nn::time (sdk+0x3d3270) moves a base it sets again on each pass
+SPIN_STOP = ((0xFC000000, 0x94000000), (0xFE000000, 0xD6000000), (0xFF000000, 0xD4000000), (0x3FC00000, 0x39000000), (0x3FC00000, 0x3D000000), (0x3FC00000, 0x3D800000),
+             (0x3FE00000, 0x38000000), (0x3FE00C00, 0x38200800), (0x3FE00000, 0x3C000000), (0x3FE00000, 0x3C800000), (0x3A400000, 0x28000000), (0x3F200C00, 0x38200000))
+def spin_quick(T, hi):
+    """a back-edge to T can be reached from T without passing a word of SPIN_STOP (only such heads get the full check, which decodes)"""
+    seen, todo = set(), [T]
+    while todo:
+        a = todo.pop()
+        if a in seen or not T <= a <= hi: continue
+        seen.add(a); w = struct.unpack_from('<I', IMG, a)[0]; t = w >> 24
+        if 0x14 <= t <= 0x17: succ = (a + (((w & 0x3FFFFFF) ^ 0x2000000) - 0x2000000) * 4,)
+        elif t == 0x54 or t & 0x7E == 0x34: succ = (a + ((((w >> 5) & 0x7FFFF) ^ 0x40000) - 0x40000) * 4, a + 4)
+        elif t & 0x7E == 0x36: succ = (a + ((((w >> 5) & 0x3FFF) ^ 0x2000) - 0x2000) * 4, a + 4)
+        elif any(w & m == v for m, v in SPIN_STOP): continue
+        else: succ = (a + 4,)
+        if T in succ: return True
+        todo.extend(succ)
+    return False
+class SpinNo(Exception): pass
+def spin_region(T, bes):
+    """the spin wait region with head T (bes: the backward branches to T found by the scan) → dict, or None"""
+    hi = max(bes)
+    if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
+    nodes, back, bad, inner = {}, set(), set(), set()
+    todo = [T]
+    while todo:
+        a = todo.pop()
+        if a in nodes or a in bad: continue
+        rmw = spin_rmw(a) if a + 12 <= hi and struct.unpack_from('<I', IMG, a)[0] & 0x3FE00000 == 0x08400000 else None   # ldxr / ldaxr
+        if rmw:
+            n = {'kind': 'rmw', 'base': rmw[0], 'k': rmw[1], 'ins': rmw[3], 'uses': {rmw[0]}, 'defs': rmw[2], 'succ': [a + 16]}
+        else:
+            x = spin_ins(a); k = spin_kind(x)
+            if k is None: bad.add(a); continue
+            if k == 'br':
+                t = x.operands[-1].imm
+                succ = [t] if x.mnemonic == 'b' else [t, a + 4]
+            else: succ = [a + 4]
+            n = {'kind': k, 'ins': [x], 'succ': succ}
+        if any(a + 4 * i in spin_touched for i in range(len(n['ins']))): bad.add(a); continue
+        nodes[a] = n
+        if n['kind'] == 'rmw': inner |= {a + 4, a + 8, a + 12}
+        for s in n['succ']:
+            if s == T: back.add(a)
+            elif T < s <= hi: todo.append(s)
+    if not back or inner & set(nodes) or any(s in inner for n in nodes.values() for s in n['succ']): return None
+    def prune(ends):
+        keep, more = set(ends), True
+        while more:
+            more = False
+            for a, n in nodes.items():
+                if a not in keep and any(s in keep and s != T for s in n['succ']): keep.add(a); more = True
+        return keep
+    R = prune(back)
+    for a in R:
+        if 'uses' not in nodes[a]: nodes[a]['uses'], nodes[a]['defs'] = spin_rw(nodes[a]['ins'][0])
+    # every path from T to a back-edge: no inner cycle, and the exclusive adds on each address (a register between two writes to it) sum to 0
+    bad_back, cnt = set(), [0, 0]
+    def walk(a, onpath, ver, delta):
+        cnt[1] += 1
+        if cnt[1] > SPIN_STEPS: raise SpinNo
+        n = nodes[a]
+        if n['kind'] == 'rmw':
+            key = (n['base'], ver.get(n['base'], 0)); delta = dict(delta); delta[key] = delta.get(key, 0) + n['k']
+        if n['defs']: ver = dict(ver); ver.update({r: ver.get(r, 0) + 1 for r in n['defs']})
+        for s in n['succ']:
+            if s == T:
+                cnt[0] += 1
+                if cnt[0] > SPIN_PATHS: raise SpinNo
+                if any(delta.values()): bad_back.add(a)
+            elif s in R:
+                if s in onpath: raise SpinNo
+                walk(s, onpath | {s}, ver, delta)
+    try: walk(T, {T}, {}, {})
+    except SpinNo: return None
+    valid = back - bad_back
+    if not valid: return None
+    R = prune(valid)
+    # no state carried from one pass to the next: nothing live at T is written in R
+    live, more = {a: set() for a in R}, True
+    while more:
+        more = False
+        for a in sorted(R, reverse=True):
+            n, out = nodes[a], set()
+            for s in n['succ']:
+                if s == T: out |= live[T] if a in valid else set()
+                elif s in R: out |= live[s]
+            new = n['uses'] | (out - n['defs'])
+            if new != live[a]: live[a] = new; more = True
+    if live[T] & set().union(*(nodes[a]['defs'] for a in R)): return None
+    return {'T': T, 'R': sorted(R), 'nodes': nodes, 'valid': valid}
+def spin_emit(g):
+    T, R, nodes, valid = g['T'], g['R'], g['nodes'], g['valid']
+    cpy, fixes, tramp = {}, [], {}
+    for i, a in enumerate(R):
+        n = nodes[a]; cpy[a] = here(); x = n['ins'][0]
+        if n['kind'] == 'rmw':
+            for y in n['ins'][:3]: emit(struct.unpack('<I', y.bytes)[0])
+            fixes.append((len(patch), n['ins'][3], a)); emit(0)         # retry: the copy's exclusive load
+        elif n['kind'] == 'pc':
+            rd, tgt = num(spin_norm(x.reg_name(x.operands[0].reg))), x.operands[1].imm
+            emit(ADRP(rd, here(), tgt))
+            if x.mnemonic == 'adr': emit(ADDI(rd, rd, tgt & 0xFFF))
+        elif n['kind'] == 'br': fixes.append((len(patch), x, None)); emit(0)
+        else: emit(struct.unpack('<I', x.bytes)[0])
+        if not (n['kind'] == 'br' and x.mnemonic == 'b'):
+            ft = a + 4 * len(n['ins'])
+            if not (i + 1 < len(R) and R[i + 1] == ft): fixes.append((len(patch), None, ft)); emit(0)   # the next instruction is not the next one copied
+    pause = here()
+    emit(STP_PRE(29, 30, 31, -16)); emit_gate_call(); emit(BLR(30)); ret = here(); emit(LDP_POST(29, 30, 31, 16))
+    gates.append((ret, 'spin', 0, T)); emit(B(here(), cpy[T]))
+    def out(t):   # an exit taken by a conditional branch: through a b next to the copy
+        if t not in tramp: tramp[t] = here(); emit(B(here(), t))
+        return tramp[t]
+    for idx, x, info in fixes:
+        pc = PATCH_OFF + idx
+        if x is None: w = B(pc, cpy.get(info, info))
+        elif info is not None: w = spin_rebranch(x, pc, cpy[info])
+        else:
+            t, cond = x.operands[-1].imm, x.mnemonic != 'b'
+            d = pause if t == T and x.address in valid else cpy[t] if t in cpy and t != T else out(t) if cond else t
+            w = spin_rebranch(x, pc, d)
+        struct.pack_into('<I', patch, idx, w)
+    for b in sorted(valid):   # the original back-edges enter the copy
+        x = nodes[b]['ins'][0]
+        if x.mnemonic == 'b': put_branch(b, cpy[T])
+        else: st = here(); emit(spin_rebranch(x, here(), cpy[T])); emit(B(here(), b + 4)); put_branch(b, st)
+    stat('spin')
+spin_regions = [g for g in (spin_region(T, spin_cand[T]) for T in sorted(spin_cand)) if g]   # all found on the unchanged image first: emitting patches back-edges
+spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a in g['R'])) for g in spin_regions]
+for g in spin_regions: spin_emit(g)
+if os.environ.get('DM_SPIN_LIST'):
+    for T, bes, n in spin_sites: print(f'{NAME} spin wait {T:#x} ({n} instructions), back-edges ' + ' '.join(f'{b:#x}' for b in bes))
 
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
 if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area
-    assert len(patch) <= FRONT - 0x4000, f'补丁区 {len(patch):#x} 字节放不进首址前的 {FRONT:#x} | patch area of {len(patch):#x} bytes does not fit in the {FRONT:#x} before the base'
+    if BIG_TEXT and len(patch) > FRONT - 0x4000 and 'DM_PATCH_FRONT' not in os.environ:
+        need = (len(patch) + 0x4000 + 0xFFFF) & ~0xFFFF
+        print(f'{NAME}: patch area of {len(patch):#x} bytes does not fit in {FRONT:#x} before the base; rewriting again with {need:#x}', flush=True)
+        os.execve(sys.executable, [sys.executable] + sys.argv, dict(os.environ, DM_PATCH_FRONT=hex(need)))
+    assert len(patch) <= FRONT - 0x4000, f'patch area of {len(patch):#x} bytes does not fit in the {FRONT:#x} before the base'
     open(P('patched.bin'), 'wb').write(IMG + bytearray(FILE_IMAGE_LEN - len(IMG)) + patch)
 else:
     open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
 import hashlib
-with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:
-    f.write(hashlib.sha256(open(os.path.abspath(__file__), 'rb').read()).hexdigest() + '  patch_nso.py\n')
-if PRIVATE_AIM:
-    with open(P('aim.tsv'), 'w') as f:
-        f.write('# RULESET\tskill-aim-v1-private\n# ORIGINAL_CALL\t0x2faf04\t97fee7fd\n# ORIGINAL_CALLEE\t0x2b4ef8\n# SKILL_CALLER\t0x2b5b80\n# SVC\t0x86\n# INPUT\tactual GetNpad sampled right; move axis unchanged\n')
-        f.write('# IMAGE_SHA256\t'+hashlib.sha256(open(P('patched.bin'),'rb').read()).hexdigest()+'\n')
-if RULE_RUN:
-    with open(P('rules.tsv'), 'w') as f:
-        f.write(f'# RULESET\t{RULESET}\n# BUILD_ID\t{BUILD_ID}\n# ORIGINAL_SHA256\t{RULE_ORIG_SHA}\n# IMAGE_SHA256\t{hashlib.sha256(open(P("patched.bin"), "rb").read()).hexdigest()}\n')
-        for off, raw, why in rule_blocks: f.write(f'{off:#x}\t{raw}\t{hashlib.sha256(bytes.fromhex(raw)).hexdigest()}\t{why}\n')
-elif os.path.exists(P('rules.tsv')):
-    os.unlink(P('rules.tsv'))  # When rebuilding native, clear this module's old rule registration so the old manifest does not leak into the original-resource domain
+with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:   # the same for every module: the rewriter and every patch file, by path from dm/tools
+    for src_ in (os.path.abspath(__file__), nso_code.__file__, nso_asm.__file__, *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
+    if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps there
+    if RENDER_SCALE: f.write('# RENDER_SCALE\t1\n')   # a render-scale stub reads state +0x10 (the loader ignores the key; dm/games/settings.py offers the setting by it)
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
@@ -933,27 +1141,12 @@ with open(P('sites.tsv'), 'w') as f:
     for wseg in windows: f.write(f'{wseg[0].address:#x}\tW\t{wseg[-1].address + 4:#x}\n')
     for a, (b, c) in jumps.items(): f.write(f'{a:#x}\tJ\t{b:#x}\t{c}\n')
     for a, tgt in tabjumps.items(): f.write(f'{a:#x}\tT\t' + ' '.join(f'{t:#x}' for t in tgt) + '\n')   # offset-table jump and all its targets
+    for t, bes, n in spin_sites: f.write(f'{t:#x}\tS\t' + ' '.join(f'{b:#x}' for b in bes) + '\n')   # spin wait: its head and the back-edges that enter its copy
 with open(P('cuts.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
-    for off, ob, nb, why, scope in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{scope}\t{why}\n')   # Columns: offset, original bytes, new bytes, scope, reason
-with open(P('params.tsv'), 'w') as f:
-    f.write(f'# BUILD_ID\t{BUILD_ID}\n')
-    for oa, wa, ob_, wb, r, key, why in params: f.write(f'{oa:#x}\t{ob_:#x}\tx{r}\t{key}\t{why}\n')
+    for off, ob, nb, why in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{why}\n')   # Columns: offset, original bytes, new bytes, reason
 with open(P('obs.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')
 print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'patch', len(patch), 'PATCH_OFF', hex(PATCH_OFF), 'slot_refs', len(fix), 'gates', len(gates))
-# The boot block list ships with main: take the repository's versioned data dm/data/bootlist_<main build ID>.tsv, copy it as is into the build output directory and write its sha256 (the list is checked in, not re-recorded for every version;
-# the recording itself is racy -- three recordings of the same build output gave block sets of 5292 / 5114 / 5281, and the initiating threads also differed -- re-record only when the build ID changes or for a deliberate improvement, and attach an A/B from the second Mac to the commit)
-if NAME == 'main':
-    import hashlib, shutil
-    BL = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', f'bootlist_{BUILD_ID}.tsv')
-    if not os.path.isfile(BL):   # the public repository does not ship this list (each line carries the first bytes of an original resource block): without it there is no prefetch, so launch skips one ahead-of-time decode step and nothing else is affected
-        print('bootlist 没有启动块清单，跳过（不预取）。要用的话自己录一份：dm/tools/tact_bootlist.py')
-    else:
-        hd = open(BL, encoding='utf-8').readline().split()
-        if hd[-1:] != [BUILD_ID]: sys.exit(f'【红】{BL} 头行构建号 {hd[-1:]} 与 main {BUILD_ID} 不符')
-        shutil.copyfile(BL, os.path.join(outdir, 'bootlist.tsv'))
-        sha = hashlib.sha256(open(BL, 'rb').read()).hexdigest()
-        open(os.path.join(outdir, 'bootlist.sha256'), 'w').write(f'{sha}  bootlist.tsv\n')
-        print('bootlist', os.path.relpath(BL), sha[:12])
+if DATA_BLOCKS: print(NAME, 'data blocks left alone:', ', '.join(f'{s:#x}..{e:#x}' for s, e in DATA_BLOCKS))

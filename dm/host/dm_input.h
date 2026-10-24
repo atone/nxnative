@@ -9,12 +9,23 @@ enum {
     DM_BTN_ZL = 1u << 8, DM_BTN_ZR = 1u << 9, DM_BTN_PLUS = 1u << 10, DM_BTN_MINUS = 1u << 11,
     DM_BTN_LEFT = 1u << 12, DM_BTN_UP = 1u << 13, DM_BTN_RIGHT = 1u << 14, DM_BTN_DOWN = 1u << 15,
 };
+#define DM_BTN_SHAKE (1ull << 63)   // not an NpadButton: the controller is shaken while set (its six-axis sensor, hle_hid.c); never reaches the game's buttons
 #define DM_STICK_MAX 32767
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
 uint64_t dm_input_samples(void);   // Cumulative number of times the game has sampled the controller
-// Physical / virtual controller (iOS GameController, dm_gamepad.m): stored separately from touch input; when the game reads the controller, buttons are
-// ORed bitwise and a stick uses the controller's value if it is non-zero. All 0 when no controller is connected, so values are bit-for-bit the same as before
+// Physical controller path (Mac GameController, DM_KEYS / DM_CTL): stored separately from the keyboard / touch input; when the game reads player 1, buttons are
+// ORed bitwise and each stick axis takes whichever source is deflected more. All 0 when no controller is connected, so values are bit-for-bit the same as before.
+// dm_pad_set is player 1's controller (DM_BTN_SHAKE counts there only); dm_pad_set_player sets player n + 1's, which the game reads on its own npad (hle_hid.c) while
+// dm_pad_players has its bit set; a player whose npad the game does not support (SetSupportedNpadIdType) feeds player 1 instead, so a one-player game sees every controller
+#define DM_PLAYERS 8   // npads No1..No8; player 1 is the Handheld npad in handheld mode (DM_OPMODE=0)
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
+void dm_pad_set_player(int player, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);   // player 0..DM_PLAYERS-1 (player 1..8)
+void dm_pad_players(uint32_t mask);   // bit p: player p + 1 has a controller; player 1 always counts as connected (the keyboard, the touch gamepad, DM_KEYS)
+uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
+// Motion sensors of a player's physical controller: acceleration in G (along gravity: lying flat face up reads about (0, 0, -1)) and angular velocity in revolutions per second, both in
+// nn::hid's controller frame. hle_hid.c fuses angle and direction from them and answers that player's six-axis sensor with them; dm_motion_clear goes back to the stand-in sensor
+void dm_motion_set(int player, const float acc[3], const float gyro_rps[3]);
+void dm_motion_clear(int player);
 
 // Optional diagnostic DM_HID_RECEIPT_LOG=<writable JSONL path>: received samples of real GetNpadState returns.
 // Fields read_start_ns/time_ns use the same host now_ns(); the front-end publish window must use the same helper, and a read interval that spans a publish must not be force-matched.
@@ -28,10 +39,3 @@ void dm_input_sampled_right(int32_t *rx,int32_t *ry);
 // Controller state injection point: called after GetNpadState has filled in the original state and before the pseudo-key override. The Mac host touch point script (touch_mac.c, Mac only, kept out of the iOS app by the _mac convention) registers at startup; iOS does not carry that file and it stays empty
 extern void (*dm_pad_hook)(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 
-// Motion sensors (six-axis) of a physical controller: acceleration in G (along gravity: lying flat face up reads about (0, 0, -1)) and angular velocity in revolutions per second,
-// both in nn::hid's controller frame. The host integrates angle and direction and answers GetSixAxisSensorState(s) from it; until the first sample the sensor reads as not connected
-void dm_motion_set(const float acc[3], const float gyro_rps[3]);
-// Vibration: the front end may define these (weak no-ops in hle_hid.c). front_vibrate gets nn::hid::VibrationValue {amplitude low, frequency low, amplitude high, frequency high}
-// for the motor on side 0 (left) or 1 (right); front_vibration_stop silences both
-void front_vibrate(int side, const float v[4]);
-void front_vibration_stop(void);

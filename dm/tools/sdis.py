@@ -64,8 +64,13 @@ def fn_starts():               # All function starts in the eh_frame_hdr binary 
         a, k = rd(o, tenc); o += k; _, k = rd(o, tenc); o += k; out.append(a)
     return sorted(set(out))
 
-def resolve(s):
-    return int(s, 16) if s.startswith('0x') else defs[s][0]
+def resolve(s):                # 0xoffset, a defined symbol, or an imported one (its PLT stub: --callers then lists the module's calls of that import)
+    if s.startswith('0x'): return int(s, 16)
+    if s in defs: return defs[s][0]
+    if not plt: plt_scan()
+    for a, n in plt.items():
+        if n == s: return a
+    sys.exit(f'{s}: neither defined nor imported through the PLT')
 
 if sys.argv[2] == '--sym':      # sdis.py <image> --sym 0xoffset...  give the containing function for each one
     plt_scan()
@@ -73,7 +78,9 @@ if sys.argv[2] == '--sym':      # sdis.py <image> --sym 0xoffset...  give the co
     sys.exit()
 if sys.argv[2] == '--xref':     # sdis.py <image> --xref 0xaddr...  find the instructions that build this address with adrp+add/ldr
     want = {int(a, 16) for a in sys.argv[3:]}
-    textend = max(v + s for v, s in defs.values() if v < 0x10000000 and s)
+    textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)
+    if not plt: plt_scan()
+    if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
     for o in range(0, min(len(img), textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w & 0x9F000000 != 0x90000000: continue
@@ -90,15 +97,17 @@ if sys.argv[2] == '--fn':       # sdis.py <image> --fn 0xaddr...  start of the c
     st = fn_starts()
     for a in sys.argv[3:]:
         a = int(a, 16); k = bisect.bisect_right(st, a) - 1
-        if k < 0 or k + 1 >= len(st): print(f'{a:#x} 不在函数表'); continue   # Before the first function / after the last function (e.g. the rewrite area): report it on its own, without dragging down the whole batch
-        print(f'{a:#x} 函数 {st[k]:#x} +{a - st[k]:#x}  下一函数 {st[k + 1]:#x}')
+        if k < 0 or k + 1 >= len(st): print(f'{a:#x} not in the function table'); continue   # Before the first function / after the last function (e.g. the rewrite area): report it on its own, without dragging down the whole batch
+        print(f'{a:#x} function {st[k]:#x} +{a - st[k]:#x}  next function {st[k + 1]:#x}')
     sys.exit()
 if sys.argv[2] == '--find':
     for n, (v, sz) in sorted(defs.items(), key=lambda x: x[1]):
         if sys.argv[3] in n: print(f'{v:#x} {sz:#x} {n}')
     sys.exit()
 if sys.argv[2] == '--callers':
-    tgt = resolve(sys.argv[3]); textend = max(v + s for v, s in defs.values() if v < 0x10000000 and s)  # Coarse upper bound
+    tgt = resolve(sys.argv[3]); textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)  # Coarse upper bound
+    if not plt: plt_scan()
+    if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
     for o in range(0, min(len(img), textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w >> 26 in (0x25, 0x05) and o + ((((w & 0x3ffffff) ^ 0x2000000) - 0x2000000) * 4) == tgt:

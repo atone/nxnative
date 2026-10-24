@@ -21,8 +21,7 @@ package	v589824
 shader_versions	v589824
 
 # ---- Graphics ----
-# Vulkan through the host's layer (dm/gfx/vk/hle_vk.m); dm/gfx/tools/vk_shaders.py translates the SPIR-V shaders into <shader dir>/vk/
-graphics	vulkan
+# main imports Vulkan, not NVN: the host's Vulkan layer (dm/gfx/vk/hle_vk.m); dm/gfx/tools/vk_shaders.py translates the SPIR-V shaders into <shader dir>/vk/
 
 # ---- Files ----
 # subsdk0 / subsdk1 (Vulkan loader, NVIDIA driver) are replaced by the host's Vulkan layer and not loaded
@@ -36,14 +35,6 @@ mem_reserve	0x100000000
 mem_alias	0x10000000
 mem_stack	0x10000000
 app_pool	0xCD500000
-
-# ---- NVN driver constant segments (Mario's values; Hades has no NVN shaders) ----
-nvn_tex_base	0x20
-nvn_tex_slots	32
-nvn_samp_base	0x568
-nvn_img_base	0x120
-nvn_img_slots	8
-nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
 
 # ---- Shader split ----
 shader_note	Hades has no NVN shaders (its SPIR-V shaders go through the Vulkan layer)

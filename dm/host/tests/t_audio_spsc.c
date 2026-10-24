@@ -20,6 +20,7 @@ void hle_signal_system_event(void *g) {
 }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 module_t *module_of(const void *p) { (void)p; return NULL; }   // call sites in the log: no guest modules in the unit test
+void dm_host_helper_qos(qos_class_t q) { (void)q; }   // hle_thread.c: the helper threads keep the default class in the unit test
 
 typedef struct {
     void *out;
@@ -117,7 +118,7 @@ int main(void) {
     atomic_store(&t.a->state, STATE_STOPPED);
     h_au_Close(out);
     int sig = atomic_load(&g_sig), after = atomic_load(&g_after_last), released = atomic_load(&t.released), failed = atomic_load(&t.failed);
-    printf("SPSC：追加/释放 %d/%d，事件 %d，最后释放后触发=%d，失败=%d\n", NBUF, released, sig, after, failed);
+    printf("SPSC: appended/released %d/%d, events %d, signaled after last release=%d, failed=%d\n", NBUF, released, sig, after, failed);
     free(t.scratch); free(t.sizes); free(t.data); free(t.bufs);
     return released != NBUF || failed || sig < 1 || !after;
 }

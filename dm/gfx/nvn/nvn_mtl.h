@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 void mtl_init(void);
+void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip);
 void mtl_set_depth_zero(int on);          // NVN depth mode: 1 = near is 0 (D3D / Metal), 0 = near is -w (GL, NVN's default); picks the vertex shaders' entry point (see shader_load in nvn_mtl.m)
 void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (GL, NVN's default), 0 = upper left (D3D / Metal); see nvn_mtl.m
 void bf_want_note(const char *key);
@@ -41,10 +42,9 @@ void mtl_drain(void);                                // Wait for all commands on
 void mtl_xv_window_tex(uint64_t serial);   // Register a window (swapchain) texture: the cross-submit validity ledger never collects it
 // External producers (the Vulkan layer, dm/gfx/vk): the shared Metal device; a serial for one of their textures; present it once their event reaches ev_val (ticket for mtl_present_wait)
 void *mtl_device(void);
+void *mtl_device_classic(void);   // the same for a layer that draws only on classic queues: a device without Metal 4 (a virtual Mac) starts too, and its presents are dropped
 uint64_t mtl_ext_tex(void *tex);
-uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val);
+uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
 void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
-void mtl_ui_ghost(int on, float px, float py, const float grid[4], float cx, float cy);   // Drag-follow image for shop items: when on=1, the icon of the item that covers screen point (px,py) and sits on the shop shelf grid `grid` (top-left x,y, width and height of one cell) is translated to center (cx,cy) and drawn once more at the end of the UI pass (normalized, top-left origin); callable from any thread
-int mtl_ui_ghost_rect(float r[4]);   // Screen rectangle (normalized) of the item recognized above; returns 0 if not recognized yet
 void mtl_hostw_lock(int on);                 // the host writing a texture from another thread (movie output): whole frames only, see nvn_mtl.m g_hostw_mu
 void mtl_tex_host_written(const void *nvntex);   // a tex_t; caller holds the lock

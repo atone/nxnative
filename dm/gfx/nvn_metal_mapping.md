@@ -1,8 +1,8 @@
 # NVN → Metal object mapping
 
-This document lists what each kind of NVN (the Switch's native graphics interface) object and command lands on in Metal within D2R Mobile's graphics layer. For the overall structure of the graphics layer see [README.md](README.md).
+This document lists what each kind of NVN (the Switch's native graphics interface) object and command lands on in Metal in the host's graphics layer. For the overall structure of the graphics layer see [README.md](README.md).
 
-Scope: the 216 NVN functions that have call sites in the game's main program (listed in `nvn/nvn_slots.tsv`). The remaining 307 are connected to a red-reporting stub that, when called, prints `【红】NVN 未实现被调用：名字` in the log ("[red] unimplemented NVN function called: name").
+Scope: the NVN functions games call. The others are connected to a red-reporting stub that, when called, prints `[RED] NVN unimplemented function called: <name>` in the log.
 
 Two conventions that run through the whole table:
 
@@ -39,8 +39,9 @@ Two conventions that run through the whole table:
 | BindUniformBuffer(s) / BindStorageBuffer(s) / BindSeparateTextures / BindSeparateSamplers / BindImages | Fills the argument buffer according to the shader's reflection json | For how slot numbers correspond to the constant sections in the shader see "Shader translation chain" in the README |
 | BindVertexBuffers | Vertex buffer = (`MTLBuffer`, offset) | — |
 | SetViewports / SetScissor / SetDepthRange / Stencil* / SetBlendColor / SetPolygonOffsetClamp | The corresponding setting on the encoder | — |
-| DrawArrays / DrawElementsInstanced | Draw / indexed draw | Metal has no quad primitive: non-indexed quads are drawn as two triangles using the shared indices 0,1,2,0,2,3; indexed quads and 8-bit indices are not implemented and report red when encountered |
-| DispatchCompute | Compute encoder, with the thread group size taken from the reflection json | The 4 compute shaders embedded in the main program use the hand-written versions in `nvn/nvn_builtin.h` |
+| DrawArrays / DrawElementsInstanced | Draw / indexed draw | Metal has no quad or triangle-fan primitive: non-indexed quads and fans are drawn as triangles through shared index buffers (0,1,2,0,2,3 per quad; 0,i,i+1 per fan triangle) with first as the base vertex; indexed quads / fans and 8-bit indices are expanded on the CPU into a 32-bit (16-bit for 8-bit lists) index list in the frame arena |
+| DrawArraysIndirect / DrawElementsIndirect | Indirect draw / indexed indirect draw | NVN's records have the layouts of `MTLDrawPrimitivesIndirectArguments` / `MTLDrawIndexedPrimitivesIndirectArguments` and are read by the GPU from the pool. Quads, fans and 8-bit indices: a compute pass before the render pass (`ixc_run`) converts the GPU-written record into indexed indirect arguments (and, for indexed draws, a 32-bit index list of at most 49,152 indices) |
+| DispatchCompute / DispatchComputeIndirect | Compute encoder, with the thread group size taken from the reflection json | The 4 compute shaders embedded in the main program use the hand-written versions in `nvn/nvn_builtin.h`. Indirect: `dispatchThreadgroupsWithIndirectBuffer` on the record; the GPU copies its group counts into the driver segment c0 + 0x200 the shader reads |
 | CopyBufferToBuffer / UpdateUniformBuffer | Buffer copies inserted in order into the command stream | The data of `UpdateUniformBuffer` is copied into command memory at record time, because NVN allows the caller to modify the original data after recording |
 | CopyBufferToTexture / CopyTextureToBuffer / CopyTextureToTexture | Texture copies | Some forms of texture-to-texture are not implemented and report red when encountered |
 | ReportCounter / ResetCounter | The counter's value is written back after the GPU completes | The "samples passed" kind is implemented with Metal's visibility result buffer |
@@ -49,7 +50,7 @@ Two conventions that run through the whole table:
 
 The following are empty implementations (`g_nops` in `hle_nvn.c`); calling them neither reports red nor has any effect:
 
-`SetPatchSize`, `MultiDrawArraysIndirectCount`, `MultiDrawElementsIndirectCount`, `DispatchComputeIndirect`, `SetDepthBounds`, `DownsampleTextureView`, `WaitSync`, `SetShaderScratchMemory`, `PushDebugGroupDynamic`, `PopDebugGroup`, `InsertDebugMarkerDynamic`, `WaitEvent`, and `nvnWindowFinalize`.
+`SetPatchSize`, `MultiDrawArraysIndirectCount`, `MultiDrawElementsIndirectCount`, `SetDepthBounds`, `DownsampleTextureView`, `WaitSync`, `SetShaderScratchMemory`, `PushDebugGroupDynamic`, `PopDebugGroup`, `InsertDebugMarkerDynamic`, `WaitEvent`, and `nvnWindowFinalize`.
 
 ## 3. Shader bindings
 
